@@ -503,9 +503,9 @@ public class AiTranslatorTests
         Assert.Equal("Bearer lm-key", Assert.Single(request.Headers.GetValues("Authorization")));
         var json = JsonNode.Parse(body)!.AsObject();
         Assert.Equal("qwen2.5-7b-instruct", json["model"]!.GetValue<string>());
-        // Düşünme alanları ve keep_alive yalnız Ollama'ya gider.
-        Assert.False(json.ContainsKey("think"));
-        Assert.False(json.ContainsKey("reasoning_effort"));
+        // LM Studio'da da düşünme kapalı (Gemma 4 gibi düşünen modeller); keep_alive yalnız Ollama'ya gider.
+        Assert.False(json["think"]!.GetValue<bool>());
+        Assert.Equal("none", json["reasoning_effort"]!.GetValue<string>());
         Assert.False(json.ContainsKey("keep_alive"));
         Assert.Equal(0, json["temperature"]!.GetValue<double>());
     }

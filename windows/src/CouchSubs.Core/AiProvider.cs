@@ -197,8 +197,11 @@ public sealed record LocalAiServer
     public static Uri PreferIPv4(Uri url) =>
         string.Equals(url.Host, "localhost", StringComparison.OrdinalIgnoreCase) ? new UriBuilder(url) { Host = "127.0.0.1" }.Uri : url;
 
-    /// <summary>Ollama'da düşünme kapatılır: Gemma, Qwen3 gibi düşünen modeller altyazı çevirisinde boşuna yavaşlar (#295).</summary>
-    public bool DisablesThinking => Kind == LocalAiServerKind.Ollama;
+    /// <summary>
+    /// Ollama ve LM Studio'da düşünme kapatılır: Gemma, Qwen3 gibi düşünen modeller altyazı çevirisinde boşuna yavaşlar
+    /// (#295). LM Studio da reasoning_effort "none" okur; Gemma 4 31B'de satır başına ~4 sn yerine ~0,4 sn.
+    /// </summary>
+    public bool DisablesThinking => Kind is LocalAiServerKind.Ollama or LocalAiServerKind.LmStudio;
 
     /// <summary>Kullanıcıya gösterilen kısa adres: "http://localhost:11434".</summary>
     public string Address => BaseUrl.GetLeftPart(UriPartial.Authority);
