@@ -4,6 +4,8 @@
 name: fork-build
 
 on:
+  push:
+    branches: [gta6]
   workflow_dispatch:
 
 jobs:
