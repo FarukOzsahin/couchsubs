@@ -413,7 +413,8 @@ public sealed class AppController : INotifyPropertyChanged, IDisposable
             if (isRunning && (old.FrameSource != value.FrameSource || windowAppChanged || captureWindowChanged || xboxFrameRateChanged || xboxAudioChanged))
             {
                 // Görüntü kaynağı, Xbox kare aralığı ya da Xbox ses çıkışı değişti: akış yeni seçimle yeniden başlar.
-                Stop();
+                // TV uygulaması kapatılmaz; kapanıp yeniden açılsa TV girişi gidip gelirdi.
+                StopForRestart();
                 _ = StartAsync().ContinueWith(task => RemotePlayLog.Note($"Çeviri yeniden başlatılamadı: {task.Exception?.GetBaseException().Message}"),
                                               TaskContinuationOptions.OnlyOnFaulted);
             }
@@ -426,7 +427,8 @@ public sealed class AppController : INotifyPropertyChanged, IDisposable
                                      || old.CpuTranslationThreads != value.CpuTranslationThreads;
             if (translationChanged && !isRunning) RefreshTranslatorStatus();
             if (isRunning && (old.SourceLanguage != value.SourceLanguage || old.TargetLanguage != value.TargetLanguage
-                              || translationChanged || old.FastSubtitleDetection != value.FastSubtitleDetection))
+                              || translationChanged || old.FastSubtitleDetection != value.FastSubtitleDetection
+                              || old.OcrEngine != value.OcrEngine))
             {
                 RefreshTranslatorStatus();
                 MakePipeline();
@@ -805,10 +807,24 @@ public sealed class AppController : INotifyPropertyChanged, IDisposable
     {
         if (services.BundledApp(TvBrand.Samsung) is not { } bundled) return;
         var remembered = !NeedsInstall(bundled);
-        if (!await services.IsSamsungDevModeOnAsync(target.Host))
+        // TV 8001'de geliştirici modunu ve Host PC IP'yi söyler (Android ve iPhone uygulaması da buna bakar). Host PC IP
+        // bu bilgisayarınki değilse TV 26101'de sdb el sıkışmasında bağlantıyı keser ve önceden yalnız genel "TV bu
+        // bilgisayarı kabul etmedi" görünüyordu (#343); bu durumda sdb hiç denenmez, iki adres de söylenir.
+        var check = await services.CheckSamsungAsync(target.Host);
+        var devModeOn = check.Info?.DeveloperMode != false && await services.IsSamsungDevModeOnAsync(target.Host);
+        if (!devModeOn)
         {
             // Geliştirici modu kapalıyken TV'ye sorulamaz; bu bilgisayarın kurduğu sürüme bakılır.
             TvApp = remembered ? new TvAppState(TvAppKind.UpToDate, InstalledAppVersion ?? bundled.Version) : new TvAppState(TvAppKind.DevModeOff);
+            return;
+        }
+        if (SamsungMessages.HostPcIpMismatch(check.Info?.DeveloperIp, check.ComputerAddress))
+        {
+            // Çalışan uygulama "kurulamadı" diye gösterilmez (Unreachable'daki gibi); güncelleme Host PC IP düzelince gelir.
+            TvApp = remembered
+                ? new TvAppState(TvAppKind.UpToDate, InstalledAppVersion ?? bundled.Version)
+                : new TvAppState(TvAppKind.Failed, Error: DevModeError.HostPcMismatch, HostPcIp: check.Info!.DeveloperIp,
+                    ComputerAddress: check.ComputerAddress);
             return;
         }
         // Güncel bilinen uygulamada denetim sessiz sürer; kart ancak kurulum başlarsa değişir.
@@ -1404,8 +1420,11 @@ public sealed class AppController : INotifyPropertyChanged, IDisposable
         if (ShowsOnTv) StartKeeper();
         else
         {
-            keeper?.Stop();
+            // Altyazı artık TV'ye gitmiyor: TV uygulaması kapanır, TV kendi girişine döner.
+            var stoppedKeeper = keeper;
             keeper = null;
+            stoppedKeeper?.Stop();
+            if (stoppedKeeper is not null) _ = server.ExitTvApp();
         }
     }
 
@@ -1470,16 +1489,28 @@ public sealed class AppController : INotifyPropertyChanged, IDisposable
     /// <summary>Bilgisayarın ağ adresiyle OBS sayfası; localhost'u kabul etmeyen yayın programları (TikTok LIVE Studio) için.</summary>
     public string? NetworkObsAddress => LocalAddress(null) is { } address ? $"http://{address}:{ServerPort}/obs" : null;
 
-    public void Stop()
+    /// <summary>Kullanıcı çeviriyi durdurdu: oturum biter, TV uygulaması da kapanır (#268).</summary>
+    public void Stop() => _ = StopSession(closeTvApp: true);
+
+    /// <summary>
+    /// Ayar değişikliği gibi iç yeniden başlatmalarda kullanılır: oturum biter ama TV uygulaması açık kalır; hemen
+    /// ardından gelen <see cref="StartAsync"/> aynı TV bağlantısını kullanır.
+    /// </summary>
+    public void StopForRestart() => _ = StopSession(closeTvApp: false);
+
+    /// <summary>Oturumu bitirir; TV uygulamasına çıkış gönderildiyse mesajın yazılmasını bekleyen görevi döner.</summary>
+    private Task StopSession(bool closeTvApp)
     {
+        var stoppedKeeper = keeper;
+        keeper = null;
+        stoppedKeeper?.Stop();
+        var exiting = closeTvApp && stoppedKeeper is not null ? server.ExitTvApp() : Task.CompletedTask;
         session?.Stop();
         session?.Dispose();
         session = null;
         UpdateGameProbe(connected: false);
         StopGameSense();
         EndGameAreas();
-        keeper?.Stop();
-        keeper = null;
         pipeline?.Reset();
         if (pipeline is not null) SubtitleLog.Write("oturum bitti");
         pipeline = null;
@@ -1503,6 +1534,7 @@ public sealed class AppController : INotifyPropertyChanged, IDisposable
         ClearFirewallPrompt();
         OverlayHidden?.Invoke();
         StreamHidden?.Invoke();
+        return exiting;
     }
 
     /// <summary>Bilgisayar uykudan uyanınca bağlantıları hemen yenile.</summary>
@@ -1584,8 +1616,11 @@ public sealed class AppController : INotifyPropertyChanged, IDisposable
         services.Translation.EngineFailure -= OnEngineFailure;
         services.Translation.GpuFallback -= OnGpuFallback;
         if (services.Xbox is { } xbox) xbox.TokenUpdated -= OnXboxTokenUpdated;
-        Stop();
+        var exiting = StopSession(closeTvApp: true);
         if (services.Xbox is IDisposable disposableXbox) disposableXbox.Dispose();
+        // Sunucu kapanmadan TV'ye çıkış mesajı yazılsın; TV yanıt vermiyorsa kapanış en çok bir saniye bekler.
+        try { exiting.Wait(TimeSpan.FromSeconds(1)); }
+        catch (AggregateException) { }
         server.Dispose();
         poolTimer?.Dispose();
         packTimer?.Dispose();
@@ -1921,9 +1956,11 @@ public sealed class AppController : INotifyPropertyChanged, IDisposable
         // Eski hatta süren okuma beklenmez; yeni hat ilk karesini hemen alır.
         frameGate.Reset();
         ActiveSourceLanguage = settings.SourceLanguage;
-        var reader = services.MakeReader(settings.SourceLanguage);
+        var reader = services.MakeReader(settings.SourceLanguage, settings.OcrEngine);
         activeReader = reader;
-        OcrMissing = reader is null || !services.HasOcrLanguage(settings.SourceLanguage);
+        // Gelişmiş yazı tanıma Windows'un dil paketine gerek duymaz.
+        OcrMissing = reader is null || (!(settings.OcrEngine == OcrEngine.Advanced && AdvancedOcrInstalled)
+                                        && !services.HasOcrLanguage(settings.SourceLanguage));
         if (reader is null) return;
         var scheduler = new ReadScheduler(maxReuse: settings.FastSubtitleDetection
             ? ReadScheduler.FastMaxReuse : ReadScheduler.DefaultMaxReuse);
@@ -1984,7 +2021,7 @@ public sealed class AppController : INotifyPropertyChanged, IDisposable
         }
         if (regionWatcher is null)
         {
-            if (services.MakeReader(settings.SourceLanguage) is not { } reader) return;
+            if (services.MakeReader(settings.SourceLanguage, settings.OcrEngine) is not { } reader) return;
             regionWatcher = new RegionWatcher(reader, MakeTranslator(), server) { Log = SubtitleLog.Write };
         }
         regionWatcher.PackLookup = PacksActive ? services.FindInPacks : null;
@@ -2291,12 +2328,15 @@ public sealed class AppController : INotifyPropertyChanged, IDisposable
 
     /// <summary>
     /// <paramref name="near"/> adresine (TV) ulaşan bu bilgisayar adresi; TV adresi bilinmiyorsa (null ya da geçersiz)
-    /// Wi-Fi/Ethernet adresi. VPN ve sanal bağdaştırıcılar ancak başka adres yoksa seçilir (<see cref="LocalNetwork.ChooseComputerAddress"/>).
+    /// Wi-Fi/Ethernet adresi. TV adresi biliniyorsa işletim sisteminin TV'ye çıkacağı bağdaştırıcının adresi önce gelir
+    /// (birden çok bağdaştırıcıda doğru kaynak adres, #343). VPN ve sanal bağdaştırıcılar ancak başka adres yoksa seçilir
+    /// (<see cref="LocalNetwork.ChooseComputerAddress(IReadOnlyList{LocalNetwork.AdapterAddress}, IPAddress?, IPAddress?)"/>).
     /// </summary>
     public static string? LocalAddress(string? near)
     {
         IPAddress? target = IPAddress.TryParse(near, out var parsed) && parsed.AddressFamily == AddressFamily.InterNetwork ? parsed : null;
-        return LocalNetwork.ChooseComputerAddress(LocalNetwork.Ipv4Adapters(), target);
+        var route = target is null ? null : LocalNetwork.RouteSourceAddress(target);
+        return LocalNetwork.ChooseComputerAddress(LocalNetwork.Ipv4Adapters(), target, route);
     }
 
     // --- Windows Güvenlik Duvarı ---
@@ -2505,6 +2545,42 @@ public sealed class AppController : INotifyPropertyChanged, IDisposable
         finally
         {
             Updating = false;
+        }
+    }
+
+    // --- Gelişmiş yazı tanıma ---
+
+    /// <summary>Bu derlemede gelişmiş yazı tanıma var mı.</summary>
+    public bool AdvancedOcrAvailable => services.AdvancedOcr is not null;
+    public bool AdvancedOcrInstalled => services.AdvancedOcr?.IsInstalled == true;
+    public long AdvancedOcrDownloadBytes => services.AdvancedOcr?.DownloadBytes ?? 0;
+    public bool AdvancedOcrDownloading { get => advancedOcrDownloading; private set => Set(ref advancedOcrDownloading, value); }
+    public double AdvancedOcrProgress { get => advancedOcrProgress; private set => Set(ref advancedOcrProgress, value); }
+    public string? AdvancedOcrError { get => advancedOcrError; private set => Set(ref advancedOcrError, value); }
+    private bool advancedOcrDownloading;
+    private double advancedOcrProgress;
+    private string? advancedOcrError;
+
+    /// <summary>Gelişmiş yazı tanımanın modellerini indirir (~31 MB); çeviri sürüyorsa okuyucu hemen değişir.</summary>
+    public async Task DownloadAdvancedOcrAsync()
+    {
+        if (services.AdvancedOcr is not { } model || advancedOcrDownloading || model.IsInstalled) return;
+        AdvancedOcrDownloading = true;
+        AdvancedOcrError = null;
+        try
+        {
+            await Task.Run(() => model.DownloadAsync(new ImmediateProgress(value => post(() => AdvancedOcrProgress = value)), CancellationToken.None));
+            if (isRunning && settings.OcrEngine == OcrEngine.Advanced) MakePipeline();
+        }
+        catch (Exception error) when (error is HttpRequestException or IOException or InvalidDataException or TaskCanceledException
+                                          or UnauthorizedAccessException)
+        {
+            AdvancedOcrError = error.Message;
+        }
+        finally
+        {
+            AdvancedOcrDownloading = false;
+            Changed(nameof(AdvancedOcrInstalled));
         }
     }
 

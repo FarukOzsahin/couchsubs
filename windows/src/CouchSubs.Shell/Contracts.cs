@@ -96,6 +96,18 @@ public enum TranslationEngine { Free, DeepL, Gemini, OpenAi, Claude, Local }
 [System.Text.Json.Serialization.JsonConverter(typeof(System.Text.Json.Serialization.JsonStringEnumConverter<TranslationDevice>))]
 public enum TranslationDevice { Cpu, Gpu }
 
+/// <summary>Altyazıyı okuyan yazı tanıma: Windows'unki ya da gelişmiş (PP-OCRv6, model indirilir).</summary>
+[System.Text.Json.Serialization.JsonConverter(typeof(System.Text.Json.Serialization.JsonStringEnumConverter<OcrEngine>))]
+public enum OcrEngine { Windows, Advanced }
+
+/// <summary>Gelişmiş yazı tanımanın modeli: kurulu mu, indir.</summary>
+public interface IOcrModel
+{
+    bool IsInstalled { get; }
+    long DownloadBytes { get; }
+    Task DownloadAsync(IProgress<double> progress, CancellationToken cancellationToken);
+}
+
 public static class TranslationEngines
 {
     public static AiProvider? Provider(this TranslationEngine engine) => engine switch
@@ -238,6 +250,8 @@ public sealed record UserSettings
     public int CpuTranslationThreads { get; init; } = CpuThreadOptions.Default;
     /// <summary>Değişmeyen altyazı bölgesinde tam OCR okumasını en fazla iki kare yeniden kullan.</summary>
     public bool FastSubtitleDetection { get; init; }
+    /// <summary>Altyazı okuyucusu. Gelişmiş seçili ama modeli inmemişse Windows'unki kullanılır.</summary>
+    public OcrEngine OcrEngine { get; init; } = OcrEngine.Windows;
     public DubbingSettings Dubbing { get; init; } = new();
     /// <summary>
     /// Açıksa çeviri <see cref="OnlineEngine"/> ile yapılır (anahtarı kayıtlıysa); kapalıysa ya da hizmete ulaşılamazsa
@@ -573,6 +587,11 @@ public interface IAppServices
     /// <summary>Samsung ve Android TV için uygulamayla gelen paket (geliştirici derlemesinde olmayabilir).</summary>
     BundledTvApp? BundledApp(TvBrand brand);
     Task<bool> IsSamsungDevModeOnAsync(string host);
+    /// <summary>
+    /// Kurulumdan önce TV'nin geliştirici modu bilgisi (8001) ve TV'ye giden yolun bu bilgisayardaki adresi. TV yanıt
+    /// vermezse Info null olur; kurulum yine denenir.
+    /// </summary>
+    Task<SamsungPreflight> CheckSamsungAsync(string host) => Task.FromResult(new SamsungPreflight(null, null));
     /// <summary>TV'deki sürüme bakar, eksik ya da eskiyse kurar; TV'deki sürümü ve kurulup kurulmadığını döner.</summary>
     Task<(string Version, bool Installed)> InstallSamsungAppAsync(string host, BundledTvApp app, Action<TvInstallEvent> onEvent);
     Task<bool> IsAndroidDebugOnAsync(string host);
@@ -582,6 +601,13 @@ public interface IAppServices
     Task<string> InstallAndroidAppAsync(string host, BundledTvApp app, Action<TvInstallEvent> onEvent);
     /// <summary>Oyun dili için yazı tanıyıcı; bilgisayarda hiç OCR dili yoksa null.</summary>
     ITextReader? MakeReader(string language);
+    /// <summary>
+    /// Altyazı okuyucusu: <paramref name="engine"/> gelişmişse ve modeli kuruluysa PP-OCRv6, değilse
+    /// <see cref="MakeReader(string)"/>.
+    /// </summary>
+    ITextReader? MakeReader(string language, OcrEngine engine) => MakeReader(language);
+    /// <summary>Gelişmiş yazı tanımanın modeli; bu derlemede yoksa null.</summary>
+    IOcrModel? AdvancedOcr => null;
     /// <summary>
     /// Oyun dilinin kendi yazı tanıma paketi yüklü mü. Değilse okuyucu sistemin diliyle (ör. Türkçe) okur ve İngilizce
     /// altyazı "thıs.messs" gibi bozulur; kullanıcıya paketi yüklemesi söylenir.
@@ -648,10 +674,16 @@ public sealed record TvInstallEvent(TvInstallEventKind Kind, Uri? Url = null, st
 public enum TvAppKind { Unknown, Working, UpToDate, DevModeOff, NeedsPassphrase, Failed, SignIn, ApproveOnTv }
 
 /// <summary>TV uygulamasının kurulum durumu.</summary>
-public sealed record TvAppState(TvAppKind Kind, string? Version = null, DevModeError? Error = null, Uri? Url = null, string? Reason = null)
+/// <param name="HostPcIp">HostPcMismatch'te TV'deki "Host PC IP".</param>
+/// <param name="ComputerAddress">HostPcMismatch'te TV'nin göreceği bu bilgisayar adresi.</param>
+public sealed record TvAppState(TvAppKind Kind, string? Version = null, DevModeError? Error = null, Uri? Url = null, string? Reason = null,
+    string? HostPcIp = null, string? ComputerAddress = null)
 {
     public static readonly TvAppState Unknown = new(TvAppKind.Unknown);
 }
+
+/// <summary>Samsung kurulumundan önceki denetim: TV'nin 8001 yanıtı ve TV'ye giden yolun bu bilgisayardaki adresi.</summary>
+public sealed record SamsungPreflight(SamsungDeveloperInfo? Info, string? ComputerAddress);
 
 /// <summary>Durum noktasının rengi: bağlı (yeşil), sorun var (turuncu), boşta (gri).</summary>
 public enum StatusTone { Idle, Warning, Good }

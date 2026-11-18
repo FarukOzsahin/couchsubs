@@ -11,6 +11,8 @@
     <string name="overlay_fallback_needs_permission">The PS5 picture is not coming through inside CouchSubs. On some TVs it stays black here; overlay mode fixes this, but it needs the \"Display over other apps\" permission.</string>
     <string name="overlay_unavailable">Overlay is selected, but this TV app from Google Play has no overlay mode, so subtitles are shown inside CouchSubs. Overlay is in the version that CouchSubs on your computer installs directly on the TV: uninstall this copy, turn on USB debugging on the TV and start the translation on your computer.</string>
     <string name="overlay_permission_how">CouchSubs on your computer grants it when it installs the TV app: start the translation there with USB debugging on. Or on the TV open Settings › Apps › Special app access › Display over other apps and turn on CouchSubs.</string>
+    <string name="overlay_choose_console_input">CouchSubs could not tell which HDMI input your console is on. Switch the TV to it with the remote; subtitles will appear on top.</string>
+    <string name="console_not_found">CouchSubs could not tell which HDMI input your console is on.</string>
     <string name="no_picture">No picture from HDMI %1$d.</string>
     <string name="no_picture_empty">No device on HDMI %1$d.</string>
     <string name="no_picture_choose">Choose the HDMI input your PS5 is connected to (arrow keys and OK, or number keys 1–4):</string>
@@ -21,6 +23,6 @@
     <string name="picker_close">Close</string>
     <string name="overlay_offer">Or switch to overlay: the TV shows the PS5 on its own HDMI input and the subtitles appear on top.</string>
     <string name="overlay_switch">Switch to overlay</string>
-    <string name="overlay_started_manual_input">Overlay is on and CouchSubs keeps running in the background. This TV does not let apps change its input: switch the TV to the PS5\'s HDMI input with the remote, and subtitles appear on top. Open CouchSubs again to turn the overlay off.</string>
+    <string name="overlay_started_manual_input">Overlay is on and CouchSubs keeps running in the background. This TV does not let apps change its input: switch the TV to the PS5\'s HDMI input with the remote, and subtitles appear on top. If they do not show on the HDMI input, this device draws HDMI outside Android (some projectors) and no app can draw over it: read the subtitles on your phone. Open CouchSubs again to turn the overlay off.</string>
     <string name="overlay_failed">Overlay could not start: this TV did not let CouchSubs show subtitles over other apps. CouchSubs stays open; you can read the subtitles on your phone.</string>
 </resources>

@@ -292,6 +292,9 @@ internal sealed class FakeServices : IAppServices
         TvCalls++;
         return Task.FromResult(SamsungDevMode);
     }
+    /// <summary>Samsung TV'nin 8001 yanıtı ve TV'ye giden yolun bu bilgisayardaki adresi.</summary>
+    public SamsungPreflight SamsungCheck { get; set; } = new(null, null);
+    public Task<SamsungPreflight> CheckSamsungAsync(string host) => Task.FromResult(SamsungCheck);
     /// <summary>Samsung TV'de kurulu sürüm (sahte TV'nin vd_applist'i); null: uygulama yok.</summary>
     public string? SamsungOnTv { get; set; }
     public Task<(string Version, bool Installed)> InstallSamsungAppAsync(string host, BundledTvApp app, Action<TvInstallEvent> onEvent)
@@ -321,6 +324,28 @@ internal sealed class FakeServices : IAppServices
     {
         ReaderLanguages.Add(language);
         return HasOcr ? new FakeReader(ReaderLines) : null;
+    }
+    public List<OcrEngine> ReaderEngines { get; } = [];
+    public ITextReader? MakeReader(string language, OcrEngine engine)
+    {
+        ReaderEngines.Add(engine);
+        return MakeReader(language);
+    }
+    public FakeOcrModel? OcrModel { get; set; }
+    public IOcrModel? AdvancedOcr => OcrModel;
+}
+
+internal sealed class FakeOcrModel : IOcrModel
+{
+    public bool IsInstalled { get; set; }
+    public long DownloadBytes => 31_000_000;
+    public Exception? Error { get; set; }
+    public Task DownloadAsync(IProgress<double> progress, CancellationToken cancellationToken)
+    {
+        if (Error is not null) throw Error;
+        progress.Report(1);
+        IsInstalled = true;
+        return Task.CompletedTask;
     }
 }
 
@@ -1207,6 +1232,91 @@ public class AppControllerRunTests
         controller.Dispose();
     }
 
+    /// TV'nin aldığı olay satırlarını arka planda toplar.
+    private static (List<string> Lines, Task Reading) CollectEvents(StreamReader reader)
+    {
+        var lines = new List<string>();
+        var reading = Task.Run(async () =>
+        {
+            try
+            {
+                while (await reader.ReadLineAsync() is { } line)
+                    lock (lines) lines.Add(line);
+            }
+            catch (IOException) { }
+            catch (ObjectDisposedException) { }
+        });
+        return (lines, reading);
+    }
+
+    private static int Count(List<string> lines, string line)
+    {
+        lock (lines) return lines.Count(l => l == line);
+    }
+
+    /// #268: ayar değişikliğiyle yeniden başlatmada TV uygulaması kapanmaz; kullanıcı durdurunca kapanır.
+    [Fact]
+    public async Task TvAppExitsOnlyWhenUserStops()
+    {
+        var (controller, services, _) = Ready();
+        await controller.StartAsync();
+        using var http = new HttpClient();
+        using var response = await http.GetAsync($"http://127.0.0.1:{controller.ServerPort}/events", HttpCompletionOption.ResponseHeadersRead);
+        using var reader = new StreamReader(await response.Content.ReadAsStreamAsync());
+        var (lines, reading) = CollectEvents(reader);
+        for (var i = 0; i < 200 && controller.TvClients == 0; i++) await Task.Delay(10);
+
+        controller.Settings = controller.Settings with { FrameSource = FrameSource.RemotePlayWindow };
+        for (var i = 0; i < 200 && services.Streams.Count < 2; i++) await Task.Delay(10);
+        Assert.True(controller.IsRunning);
+        await Task.Delay(300);
+        Assert.Equal(0, Count(lines, "event: exit"));
+
+        controller.Stop();
+        for (var i = 0; i < 300 && Count(lines, "event: exit") == 0; i++) await Task.Delay(10);
+        Assert.Equal(1, Count(lines, "event: exit"));
+        controller.Dispose();
+        // Okuyucu, arka planda okuma sürerken kapatılırsa HttpContentReadStream.Dispose NullReferenceException atar.
+        await reading.WaitAsync(TimeSpan.FromSeconds(5));
+    }
+
+    /// #268: uygulama kapanırken çıkış mesajı sunucu kapanmadan TV'ye yazılır.
+    [Fact]
+    public async Task DisposeSendsTvExitBeforeServerCloses()
+    {
+        var (controller, _, _) = Ready();
+        await controller.StartAsync();
+        using var http = new HttpClient();
+        using var response = await http.GetAsync($"http://127.0.0.1:{controller.ServerPort}/events", HttpCompletionOption.ResponseHeadersRead);
+        using var reader = new StreamReader(await response.Content.ReadAsStreamAsync());
+        var (lines, reading) = CollectEvents(reader);
+        for (var i = 0; i < 200 && controller.TvClients == 0; i++) await Task.Delay(10);
+
+        controller.Dispose();
+        await reading.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.Equal(1, Count(lines, "event: exit"));
+    }
+
+    /// Çeviri sürerken altyazı TV'den kaldırılınca TV uygulaması kapanır.
+    [Fact]
+    public async Task RemovingTvOutputExitsTvApp()
+    {
+        var (controller, _, _) = Ready();
+        await controller.StartAsync();
+        using var http = new HttpClient();
+        using var response = await http.GetAsync($"http://127.0.0.1:{controller.ServerPort}/events", HttpCompletionOption.ResponseHeadersRead);
+        using var reader = new StreamReader(await response.Content.ReadAsStreamAsync());
+        var (lines, reading) = CollectEvents(reader);
+        for (var i = 0; i < 200 && controller.TvClients == 0; i++) await Task.Delay(10);
+
+        controller.Settings = controller.Settings with { Output = SubtitleOutput.Computer };
+        for (var i = 0; i < 300 && Count(lines, "event: exit") == 0; i++) await Task.Delay(10);
+        Assert.Equal(1, Count(lines, "event: exit"));
+        Assert.True(controller.IsRunning);
+        controller.Dispose();
+        await reading.WaitAsync(TimeSpan.FromSeconds(5));
+    }
+
     [Fact]
     public void SettingsArePersistedOutsideTheSecureStore()
     {
@@ -1217,6 +1327,43 @@ public class AppControllerRunTests
         // Güvenli depoda yalnız kurulumun bitip bitmediği durur.
         Assert.Equal([StoreKeys.SetupComplete], store.Values.Keys);
         Assert.Equal(58, AppControllerTests.Make(store: store, settings: settings).Settings.Style.FontSize);
+    }
+
+    [Fact]
+    public async Task ChangingTextRecognitionWhileRunningRebuildsPipelineWithTheNewReader()
+    {
+        var (controller, services, _) = Ready();
+        await controller.StartAsync();
+        controller.Settings = controller.Settings with { OcrEngine = OcrEngine.Advanced };
+        Assert.Equal([OcrEngine.Windows, OcrEngine.Advanced], services.ReaderEngines);
+        controller.Dispose();
+    }
+
+    [Fact]
+    public async Task DownloadingTheAdvancedModelWhileItIsChosenSwitchesTheReader()
+    {
+        var (controller, services, _) = Ready();
+        services.OcrModel = new FakeOcrModel();
+        controller.Settings = controller.Settings with { OcrEngine = OcrEngine.Advanced };
+        await controller.StartAsync();
+        Assert.False(controller.AdvancedOcrInstalled);
+        await controller.DownloadAdvancedOcrAsync();
+        Assert.True(controller.AdvancedOcrInstalled);
+        Assert.Null(controller.AdvancedOcrError);
+        Assert.Equal([OcrEngine.Advanced, OcrEngine.Advanced], services.ReaderEngines);
+        controller.Dispose();
+    }
+
+    [Fact]
+    public async Task AFailedAdvancedModelDownloadIsReported()
+    {
+        var (controller, services, _) = Ready();
+        services.OcrModel = new FakeOcrModel { Error = new HttpRequestException("offline") };
+        await controller.DownloadAdvancedOcrAsync();
+        Assert.False(controller.AdvancedOcrInstalled);
+        Assert.Equal("offline", controller.AdvancedOcrError);
+        Assert.False(controller.AdvancedOcrDownloading);
+        controller.Dispose();
     }
 
     [Fact]
@@ -1697,6 +1844,61 @@ public class TvAppInstallTests
         await controller.RefreshTvAppAsync();
         Assert.Equal(DevModeError.Unreachable, controller.TvApp.Error);
         Assert.Equal("sdb: closed", controller.TvApp.Reason);
+    }
+
+    // #343: TV'deki Host PC IP başka bir adres; sdb denenmez, iki adres de söylenir.
+    [Fact]
+    public async Task SamsungWithAnotherHostPcIpSaysWhichAddressToTypeWithoutTryingSdb()
+    {
+        var services = new FakeServices
+        {
+            SamsungDevMode = true,
+            SamsungCheck = new SamsungPreflight(new SamsungDeveloperInfo(true, "192.168.1.50"), "192.168.1.34"),
+        };
+        services.Bundled[TvBrand.Samsung] = SamsungApp;
+        var controller = Make(services);
+        await controller.PairAsync(Samsung);
+        Assert.Equal(new TvAppState(TvAppKind.Failed, Error: DevModeError.HostPcMismatch, HostPcIp: "192.168.1.50",
+            ComputerAddress: "192.168.1.34"), controller.TvApp);
+        Assert.Empty(services.BrandInstalls);
+
+        var tr = TvAppMessages.Problem(controller.TvApp, TvBrand.Samsung, Localizer.ForLanguage("tr"), "x.log");
+        Assert.Contains("192.168.1.50", tr);
+        Assert.Contains("192.168.1.34", tr);
+        Assert.Contains("2 sn", tr);
+        var en = TvAppMessages.Problem(controller.TvApp, TvBrand.Samsung, Localizer.ForLanguage("en"), "x.log");
+        Assert.StartsWith("The TV's Host PC IP is 192.168.1.50, but this computer's address is 192.168.1.34.", en);
+
+        // Host PC IP düzeltilince kurulur.
+        services.SamsungCheck = new SamsungPreflight(new SamsungDeveloperInfo(true, "192.168.1.34"), "192.168.1.34");
+        await controller.RefreshTvAppAsync();
+        Assert.Equal(new TvAppState(TvAppKind.UpToDate, "0.7.0"), controller.TvApp);
+    }
+
+    [Fact]
+    public async Task SamsungSayingDeveloperModeIsOffShowsTheSteps()
+    {
+        // 26101 açık görünse de TV geliştirici modunun kapalı olduğunu söylüyorsa adımlar gösterilir.
+        var services = new FakeServices
+        {
+            SamsungDevMode = true,
+            SamsungCheck = new SamsungPreflight(new SamsungDeveloperInfo(false, null), "192.168.1.34"),
+        };
+        services.Bundled[TvBrand.Samsung] = SamsungApp;
+        var controller = Make(services);
+        await controller.PairAsync(Samsung);
+        Assert.Equal(TvAppKind.DevModeOff, controller.TvApp.Kind);
+        Assert.Empty(services.BrandInstalls);
+    }
+
+    [Fact]
+    public void SamsungUnreachableSaysThisComputersAddress()
+    {
+        var state = new TvAppState(TvAppKind.Failed, Error: DevModeError.Unreachable);
+        var text = TvAppMessages.Problem(state, TvBrand.Samsung, Localizer.ForLanguage("tr"), "x.log", "192.168.1.34");
+        Assert.Contains("192.168.1.34", text);
+        Assert.NotEqual(TvAppMessages.ComputerAddressLine, Localizer.ForLanguage("tr")[TvAppMessages.ComputerAddressLine]);
+        Assert.DoesNotContain("192.168.1.34", TvAppMessages.Problem(state, TvBrand.Lg, Localizer.ForLanguage("tr"), "x.log", "192.168.1.34"));
     }
 
     [Fact]
