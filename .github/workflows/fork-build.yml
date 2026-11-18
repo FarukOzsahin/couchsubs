@@ -1,0 +1,19 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Fork derlemesi: Android TV uygulamasını (geliştirme anahtarıyla) derler ve Windows uygulamasına gömer.
+# Sürüm yayınlamaz; çıktılar Actions sayfasında "couchsubs-windows-installer" ve "couchsubs-windows" olarak durur.
+name: fork-build
+
+on:
+  workflow_dispatch:
+
+jobs:
+  android:
+    uses: ./.github/workflows/tv-android.yml
+    with:
+      require-signing: false
+
+  windows:
+    needs: android
+    uses: ./.github/workflows/windows.yml
+    with:
+      with-android: true

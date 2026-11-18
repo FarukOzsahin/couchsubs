@@ -80,6 +80,7 @@ public static class AiRequest
     {
         var parts = new List<string>();
         if (!string.IsNullOrEmpty(game)) parts.Add($"Game: {game}");
+        if (GameGlossary.For(game) is { } glossary) parts.Add(glossary);
         if (names is { Count: > 0 })
             parts.Add($"Character names (keep them exactly as written, do not translate them): {string.Join(", ", names)}");
         if (context.Count > 0)

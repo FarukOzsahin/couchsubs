@@ -9,6 +9,11 @@
   </ItemGroup>
 
   <ItemGroup>
+    <!-- Oyuna özel terim sözlüğü (GameGlossary): yapay zekâ isteğine eklenir. -->
+    <EmbeddedResource Include="..\..\..\tools\packs\glossary\gta6.json" LogicalName="glossary/gta6.json" />
+  </ItemGroup>
+
+  <ItemGroup>
     <InternalsVisibleTo Include="CouchSubs.Translation.Tests" />
   </ItemGroup>
 
