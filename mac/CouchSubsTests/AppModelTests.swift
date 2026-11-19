@@ -137,7 +137,10 @@ final class FakeServices: AppServices {
     }
     func isAndroidDebugOn(host: String) async -> Bool { androidHosts.contains(host) }
     func scanAndroidTVs() async -> [String] { androidHosts }
-    func installAndroidApp(host: String, app: BundledTVApp, onEvent: @escaping @Sendable (TVInstallEvent) -> Void) async throws -> String {
+    /// Her Android kurulumunda "güncelse de aç" istendi mi.
+    var androidOpenRequests: [Bool] = []
+    func installAndroidApp(host: String, app: BundledTVApp, open: Bool, onEvent: @escaping @Sendable (TVInstallEvent) -> Void) async throws -> String {
+        androidOpenRequests.append(open)
         events.forEach(onEvent)
         if let installError { throw installError }
         brandInstalls.append((.androidTV, host))
@@ -532,6 +535,22 @@ final class AppModelTests: XCTestCase {
         XCTAssertEqual(store.load(String.self, for: StoreKey.tvKey), "tv-key")
     }
 
+    /// "TV'de test et": TV uygulaması bağlı değilse önce TV'de açılır (Samsung 65S95F'de TV'ye hiçbir şey gelmiyordu);
+    /// çeviri sürmüyorsa geçici bekçi bekleme bitince kapanır.
+    func testTestOnTVOpensTheTVAppWhenItIsNotConnected() async {
+        let services = FakeServices()
+        let store = MemoryStore()
+        store.save(LGTV(name: "Samsung", host: "127.0.0.1", brand: .samsung), for: StoreKey.tv)
+        store.save("tv-key", for: StoreKey.tvKey)
+        let model = AppModel(services: services, store: store, defaults: .isolated())
+        model.settings.output = .tv
+        model.testTVWait = .milliseconds(300)
+        await model.testSubtitle()
+        XCTAssertEqual(services.keepers.count, 1)
+        XCTAssertFalse(services.keepers[0].running)
+        XCTAssertFalse(model.openingTVAppForTest)
+    }
+
     /// #40: Samsung jetonla gelen bağlantıda jeton göndermeyince saklı jeton silinmemeli (yoksa TV her seferinde izin sorar).
     func testPairingWithoutNewTokenKeepsSavedToken() async throws {
         let services = FakeServices()
@@ -839,7 +858,12 @@ final class AppModelRunTests: XCTestCase {
         XCTAssertEqual(AppModel.statusText(.disconnected(.consoleAsleep), running: true), String(localized: "Turn on your PS5"))
         XCTAssertEqual(AppModel.statusText(.disconnected(.inUse), running: true), String(localized: "Remote Play is in use on another device"))
         XCTAssertEqual(AppModel.statusText(.disconnected(.refused), running: true), String(localized: "The PS5 refused the connection. Set up the PS5 again."))
-        XCTAssertEqual(AppModel.statusText(.disconnected(.network), running: true), String(localized: "Can't reach the PS5. Reconnecting…"))
+        XCTAssertEqual(AppModel.statusText(.disconnected(.network), running: true),
+                       String(localized: "Lost the connection to the PS5. Reconnecting… If this keeps happening, connect the PS5 to the router with a cable."))
+        // 0x80108b12: PS5'te Uzaktan Oynatma kapalı (GitHub #9); genel "başka Remote Play açık olabilir" metni yanıltıyordu.
+        let disabled = AppModel.statusText(.disconnected(.rejected(DisconnectReason.remotePlayDisabled)), running: true)
+        XCTAssertTrue(disabled.contains("0x80108b12"))
+        XCTAssertNotEqual(disabled, AppModel.statusText(.disconnected(.rejected(0x80108bff)), running: true))
         XCTAssertEqual(AppModel.statusText(.disconnected(.registrationInvalid), running: true),
                        String(localized: "The PS5 didn't accept this pairing. Pair the PS5 again with the second account in Settings."))
         // PS5 oturum isteğini reddetti: kod metinde, libchiaki'nin "Unknown Session Request Error"u değil (GitHub #33, #202).
@@ -1265,6 +1289,73 @@ final class TVAppInstallTests: XCTestCase {
         XCTAssertEqual(model.tvApp, .upToDate("0.7.0"))
         XCTAssertEqual(model.tv?.host, "192.168.1.40")
         XCTAssertEqual(store.load(LGTV.self, for: StoreKey.tv)?.host, "192.168.1.40")
+    }
+
+    // #352, #389: TV'den kaldırılan uygulama; TV sihirbazda yeniden seçilince adres boşalıyor, kayıtlı sürüm kalıyordu.
+    // Kart "hazır" diyor, ağda TV aranmıyor, kurulum hiç denenmiyordu.
+    func testReselectedAndroidTVWithARememberedVersionIsCheckedOnTheTV() async {
+        let services = FakeServices()
+        services.bundled[.androidTV] = BundledTVApp(url: URL(fileURLWithPath: "/tmp/a_0.7.0.apk"), version: "0.7.0")
+        services.androidHosts = ["192.168.1.40"]
+        let store = MemoryStore()
+        store.save("0.7.0", for: StoreKey.tvAppVersion)
+        let model = model(services, store: store)
+        model.tv = LGTV(name: "Android TV", host: "", brand: .androidTV)
+        await model.refreshTVApp()
+        XCTAssertEqual(services.brandInstalls.map { $0.host }, ["192.168.1.40"])
+        XCTAssertEqual(model.tvApp, .upToDate("0.7.0"))
+    }
+
+    func testReselectedAndroidTVThatCannotBeFoundShowsTheDebuggingSteps() async {
+        let services = FakeServices()
+        services.bundled[.androidTV] = BundledTVApp(url: URL(fileURLWithPath: "/tmp/a_0.7.0.apk"), version: "0.7.0")
+        let store = MemoryStore()
+        store.save("0.7.0", for: StoreKey.tvAppVersion)
+        let model = model(services, store: store)
+        model.tv = LGTV(name: "Android TV", host: "", brand: .androidTV)
+        await model.refreshTVApp()
+        XCTAssertEqual(model.tvApp, .devModeOff)
+    }
+
+    func testReinstallForgetsTheVersionChecksTheTVAndOpensTheApp() async {
+        let services = FakeServices()
+        services.bundled[.androidTV] = BundledTVApp(url: URL(fileURLWithPath: "/tmp/a_0.7.0.apk"), version: "0.7.0")
+        services.androidHosts = ["192.168.1.40"]
+        let store = MemoryStore()
+        store.save("0.7.0", for: StoreKey.tvAppVersion)
+        let model = model(services, store: store)
+        model.tv = LGTV(name: "Android TV", host: "192.168.1.40", brand: .androidTV)
+        XCTAssertTrue(model.canReinstallTVApp)
+        await model.reinstallTVApp()
+        XCTAssertEqual(services.androidOpenRequests, [true])
+        XCTAssertEqual(model.tvApp, .upToDate("0.7.0"))
+        // "Açılsın" isteği bir kerelik.
+        await model.refreshTVApp()
+        XCTAssertEqual(services.androidOpenRequests, [true, false])
+    }
+
+    func testReinstallWithoutDebuggingShowsTheDebuggingSteps() async {
+        let services = FakeServices()
+        services.bundled[.androidTV] = BundledTVApp(url: URL(fileURLWithPath: "/tmp/a_0.7.0.apk"), version: "0.7.0")
+        let store = MemoryStore()
+        store.save("0.7.0", for: StoreKey.tvAppVersion)
+        let model = model(services, store: store)
+        model.tv = LGTV(name: "Android TV", host: "192.168.1.40", brand: .androidTV)
+        await model.reinstallTVApp()
+        XCTAssertNil(store.load(String.self, for: StoreKey.tvAppVersion))
+        XCTAssertEqual(model.tvApp, .devModeOff)
+    }
+
+    func testReinstallIsOfferedOnlyForSamsungAndAndroidTV() {
+        let services = FakeServices()
+        services.bundled[.androidTV] = BundledTVApp(url: URL(fileURLWithPath: "/tmp/a_0.7.0.apk"), version: "0.7.0")
+        let model = model(services)
+        model.tv = LGTV(name: "LG TV", host: "192.168.1.153")
+        XCTAssertFalse(model.canReinstallTVApp)
+        model.tv = LGTV(name: "Android TV", host: "", brand: .androidTV)
+        XCTAssertTrue(model.canReinstallTVApp)
+        model.tvClients = 1
+        XCTAssertFalse(model.canReinstallTVApp)
     }
 
     func testInstalledAndroidAppNeedsNothingWhenDebuggingIsOff() async {

@@ -44,6 +44,11 @@ public sealed class AppController : INotifyPropertyChanged, IDisposable
     private bool tvAppMissing;
     /// <summary>TV uygulaması denetimi sürüyor (bekleme ekranı ve çeviri başlangıcı aynı anda çağırabilir).</summary>
     private bool refreshingTvApp;
+    /// <summary>"TV uygulamasını yeniden kur"a basıldı: Samsung ve Android TV'de uygulama kuruluysa da TV'de açılır.</summary>
+    private bool openTvAppAfterCheck;
+    /// <summary>Birden çok Android TV bulununca kullanıcının seçtiği TV; yalnız bir sonraki denetimde kullanılır. Kurulum
+    /// başarılı olursa TV'nin adresi zaten kaydedilir; olmazsa bir sonraki denemede yeniden sorulur (#425).</summary>
+    private string? androidTvChoice;
     private int? devModeHoursLeft;
     private UserSettings settings;
     private bool isRunning;
@@ -208,6 +213,16 @@ public sealed class AppController : INotifyPropertyChanged, IDisposable
     public bool ConsoleKindLocked => consoleKindLocked;
     public bool IsXbox => consoleKind == GameConsoleKind.Xbox;
     public string ConsoleTitle => IsXbox ? "Xbox" : settings.FrameSource == FrameSource.CaptureWindow ? text["Selected window"] : "PS5";
+    /// <summary>
+    /// Ana ekrandaki "Görüntü kaynağı" satırının değeri: görüntünün nereden okunduğu, dokununca Ayarlar › Görüntü kaynağı
+    /// açılır. DM'de bildirildi: ayar yalnız Ayarlar'ın alt sıralarında olduğu için bulunamıyordu. Xbox'ta seçim yok, null.
+    /// </summary>
+    public string? PictureSourceTitle => IsXbox ? null : text[settings.FrameSource switch
+    {
+        FrameSource.RemotePlayWindow => "Remote Play window on this PC",
+        FrameSource.CaptureWindow => "OBS projector or game window",
+        _ => "The PS5 (second account)",
+    }];
     public bool HasXboxAccount => xboxToken is not null;
     public XboxConsole? SelectedXboxConsole => xboxConsole;
     public void SelectConsoleKind(GameConsoleKind kind)
@@ -328,7 +343,7 @@ public sealed class AppController : INotifyPropertyChanged, IDisposable
         _ => text["Retrying the Xbox connection…"],
     };
     public StatusTone Ps5Tone => Ps5ToneFor(sessionState, isRunning);
-    public int TvClients { get => tvClients; private set => Set(ref tvClients, value, [nameof(TvTone), nameof(TvStatusText)]); }
+    public int TvClients { get => tvClients; private set => Set(ref tvClients, value, [nameof(TvTone), nameof(TvStatusText), nameof(CanReinstallTvApp)]); }
     public StatusTone TvTone => HasTv ? TvToneFor(tvClients, isRunning) : StatusTone.Idle;
     public string TvStatusText => !HasTv ? text["Not set up"] : tvClients > 0 ? text["Connected"] : text["Waiting for the TV app"];
     /// <summary>Eşleşmiş bir TV var.</summary>
@@ -419,7 +434,8 @@ public sealed class AppController : INotifyPropertyChanged, IDisposable
                                               TaskContinuationOptions.OnlyOnFaulted);
             }
             var translationChanged = old.OnlineTranslation != value.OnlineTranslation || old.OnlineEngine != value.OnlineEngine
-                                     || old.GeminiModel != value.GeminiModel || old.OpenAiModel != value.OpenAiModel
+                                     || old.GeminiModel != value.GeminiModel || old.GeminiPaidTier != value.GeminiPaidTier
+                                     || old.OpenAiModel != value.OpenAiModel
                                      || old.ClaudeModel != value.ClaudeModel
                                      || old.LocalAiBaseUrl != value.LocalAiBaseUrl || old.LocalAiModel != value.LocalAiModel
                                      || old.AiInstruction != value.AiInstruction
@@ -428,6 +444,7 @@ public sealed class AppController : INotifyPropertyChanged, IDisposable
             if (translationChanged && !isRunning) RefreshTranslatorStatus();
             if (isRunning && (old.SourceLanguage != value.SourceLanguage || old.TargetLanguage != value.TargetLanguage
                               || translationChanged || old.FastSubtitleDetection != value.FastSubtitleDetection
+                              || old.WatchSubtitleBackground != value.WatchSubtitleBackground
                               || old.OcrEngine != value.OcrEngine))
             {
                 RefreshTranslatorStatus();
@@ -698,7 +715,7 @@ public sealed class AppController : INotifyPropertyChanged, IDisposable
         tvAppMissing = !pairing.Launched;
         // Daha önce "TV'm yok" seçildiyse TV bağlanınca altyazı TV'ye gider.
         if (settings.Output == SubtitleOutput.Computer) Settings = settings with { Output = SubtitleOutput.Tv };
-        Changed(nameof(Tv), nameof(CanAdvance), nameof(CanInstallTvApp), nameof(HasTv), nameof(NeedsTv), nameof(CanStart),
+        Changed(nameof(Tv), nameof(CanAdvance), nameof(CanInstallTvApp), nameof(CanReinstallTvApp), nameof(HasTv), nameof(NeedsTv), nameof(CanStart),
             nameof(TvStatusText), nameof(TvTone));
         if (target.Brand == TvBrand.Lg) await RefreshTvAppAsync();
         // Samsung girişi ya da Android onayı dakikalar sürebilir; eşleşme beklemesin.
@@ -806,6 +823,9 @@ public sealed class AppController : INotifyPropertyChanged, IDisposable
     private async Task RefreshSamsungAppAsync(LgTv target)
     {
         if (services.BundledApp(TvBrand.Samsung) is not { } bundled) return;
+        // "TV uygulamasını yeniden kur": güncel uygulama da TV'de açılır (Android'deki gibi). İstek bir kerelik.
+        var open = openTvAppAfterCheck;
+        openTvAppAfterCheck = false;
         var remembered = !NeedsInstall(bundled);
         // TV 8001'de geliştirici modunu ve Host PC IP'yi söyler (Android ve iPhone uygulaması da buna bakar). Host PC IP
         // bu bilgisayarınki değilse TV 26101'de sdb el sıkışmasında bağlantıyı keser ve önceden yalnız genel "TV bu
@@ -832,7 +852,7 @@ public sealed class AppController : INotifyPropertyChanged, IDisposable
         samsungCheckRunning = true;
         try
         {
-            var (version, installed) = await services.InstallSamsungAppAsync(target.Host, bundled, e => post(() => InstallEvent(e)));
+            var (version, installed) = await services.InstallSamsungAppAsync(target.Host, bundled, open, e => post(() => InstallEvent(e)));
             version = string.IsNullOrWhiteSpace(version) ? bundled.Version : version;
             store.Save(StoreKeys.TvAppVersion, version);
             TvApp = new TvAppState(TvAppKind.UpToDate, version);
@@ -864,23 +884,34 @@ public sealed class AppController : INotifyPropertyChanged, IDisposable
         var host = target.Host;
         if (host.Length == 0 || !await services.IsAndroidDebugOnAsync(host))
         {
-            // Uygulama kuruluysa ve TV'de hata ayıklama kapalıysa yapılacak bir şey yok.
-            if (!NeedsInstall(bundled))
+            // Bu bilgisayarın kurduğu sürüm kayıtlıysa ve TV'de hata ayıklama kapalıysa yapılacak bir şey yok. Ama kayda
+            // ancak TV'nin adresi biliniyorsa ya da TV uygulaması şu an bağlıysa güvenilir: TV sihirbazda yeniden seçilince
+            // adres boşalıyor, kayıt kalıyordu; TV'den kaldırılan uygulama "hazır" görünüyor, ağda TV hiç aranmıyor ve
+            // kurulum denenmiyordu (#352, #389).
+            if (!NeedsInstall(bundled) && (target.Host.Length > 0 || tvClients > 0))
             {
                 TvApp = new TvAppState(TvAppKind.UpToDate, InstalledAppVersion ?? bundled.Version);
                 return;
             }
-            if ((await services.ScanAndroidTvsAsync()).FirstOrDefault() is not { } found)
+            // Birden çok TV varsa ilk bulunana gidilmez: kayıtlı ya da seçilen TV, yoksa kullanıcıya sorulur. Eskiden izin
+            // sorusu başka odadaki TV'de çıkıyor, kurulum "onaylanmadı" diye bitiyordu (#425).
+            var choice = androidTvChoice;
+            androidTvChoice = null;
+            var found = await services.ScanAndroidTvsAsync();
+            var hosts = AndroidTvPick.Hosts(found);
+            if (AndroidTvPick.Pick(found, [choice, target.Host]) is not { } picked)
             {
-                TvApp = new TvAppState(TvAppKind.DevModeOff);
+                TvApp = hosts.Count == 0 ? new TvAppState(TvAppKind.DevModeOff) : new TvAppState(TvAppKind.ChooseAndroidTv, Hosts: hosts);
                 return;
             }
-            host = found;
+            host = picked;
         }
         TvApp = new TvAppState(TvAppKind.Working);
+        var open = openTvAppAfterCheck;
+        openTvAppAfterCheck = false;
         try
         {
-            var version = await services.InstallAndroidAppAsync(host, bundled, e => post(() => InstallEvent(e)));
+            var version = await services.InstallAndroidAppAsync(host, bundled, open, e => post(() => InstallEvent(e)));
             // TV'nin adresi bundan sonra sürüm denetimi için kullanılır.
             var located = target with { Host = host };
             tv = located;
@@ -898,9 +929,14 @@ public sealed class AppController : INotifyPropertyChanged, IDisposable
     private void InstallEvent(TvInstallEvent e)
     {
         // Kurulum bittikten sonra gelen geç olay sonucu ezmesin.
-        if (!samsungCheckRunning && TvApp.Kind is not (TvAppKind.Working or TvAppKind.SignIn or TvAppKind.ApproveOnTv)) return;
+        if (!samsungCheckRunning && TvApp.Kind is not (TvAppKind.Working or TvAppKind.SignIn or TvAppKind.ApproveOnTv or TvAppKind.PressInstallOnTv)) return;
         switch (e.Kind)
         {
+            // Android TV'de Google Play sayfası açıldı: kullanıcı TV'de Yükle'ye basmalı. Önceden kart yalnız "kuruluyor"
+            // diyordu; TV'deki sayfayı görmeyen kullanıcı dört dakika boyunca bir şey olmuyor sanıyordu.
+            case TvInstallEventKind.Progress when e.Step == "play":
+                TvApp = new TvAppState(TvAppKind.PressInstallOnTv);
+                break;
             case TvInstallEventKind.SignIn when e.Url is { } url:
                 TvApp = new TvAppState(TvAppKind.SignIn, Url: url);
                 OpenInBrowser(url);
@@ -916,6 +952,33 @@ public sealed class AppController : INotifyPropertyChanged, IDisposable
                 TvApp = new TvAppState(TvAppKind.Working);
                 break;
         }
+    }
+
+    /// <summary>
+    /// Samsung ve Android TV'de TV uygulaması bağlı değilken "TV uygulamasını yeniden kur" görünür (ana ekran ve TV kartı).
+    /// TV'den kaldırılan uygulama bu bilgisayarın kaydında "kurulu" kalıyordu (#352, #389).
+    /// </summary>
+    public bool CanReinstallTvApp => tv is { Brand: TvBrand.Samsung or TvBrand.AndroidTv } && CanInstallTvApp && tvClients == 0;
+
+    /// <summary>
+    /// Kurulan sürüm kaydını unutur ve TV'ye yeniden bakar: uygulama TV'de yoksa kurulur, Android TV'de varsa açılır.
+    /// TV'ye ulaşılamazsa kart geliştirici modu / hata ayıklama adımlarını gösterir.
+    /// </summary>
+    /// <summary>Birden çok Android TV arasından seçilen TV'ye kurulur (#425).</summary>
+    public async Task ChooseAndroidTvAsync(string host)
+    {
+        androidTvChoice = host;
+        TvApp = new TvAppState(TvAppKind.Working);
+        await RefreshTvAppAsync();
+    }
+
+    public async Task ReinstallTvAppAsync()
+    {
+        if (tv is null) return;
+        store.Remove(StoreKeys.TvAppVersion);
+        openTvAppAfterCheck = true;
+        TvApp = TvAppState.Unknown;
+        await RefreshTvAppAsync();
     }
 
     /// <summary>Key Server'dan anahtarı alır (TV ekranındaki parolayla) ve uygulamayı kurar.</summary>
@@ -1052,7 +1115,53 @@ public sealed class AppController : INotifyPropertyChanged, IDisposable
     public async Task SendTestSubtitleAsync()
     {
         try { await StartServerAsync(); } catch (SocketException) { }
+        // TV uygulaması bağlı değilse deneme altyazısı kimseye gitmiyordu: bekçi yalnız çeviri sürerken çalışır, TV
+        // uygulaması kapalıysa ya da bilgisayarı arıyorsa "TV'de test et"e TV'de hiçbir şey çıkmıyordu (Samsung 65S95F).
+        // Önce TV uygulaması açılır (Samsung'da geliştirici bağlantısıyla) ve bağlanması beklenir.
+        if (ShowsOnTv && HasTv && tv is { Brand: not TvBrand.AndroidTv } target && server.ConnectedClients == 0)
+            await OpenTvAppForTestAsync(target);
         SendTestSubtitle();
+    }
+
+    /// <summary>"TV'de test et"te TV uygulamasının açılıp bağlanması için en çok bu kadar beklenir.</summary>
+    public TimeSpan TestTvWait { get; set; } = TimeSpan.FromSeconds(20);
+
+    /// <summary>Deneme altyazısından önce TV uygulaması bağlanıyor (ana ekrandaki düğme beklerken bunu gösterir).</summary>
+    public bool OpeningTvAppForTest
+    {
+        get => openingTvAppForTest;
+        private set => Set(ref openingTvAppForTest, value);
+    }
+
+    private bool openingTvAppForTest;
+
+    /// <summary>
+    /// TV uygulamasını açar ve bağlanmasını bekler. Çeviri sürüyorsa bekçi hemen yeniden dener; sürmüyorsa geçici bir
+    /// bekçi kurulur, bekleme bitince kapanır.
+    /// </summary>
+    private async Task OpenTvAppForTestAsync(LgTv target)
+    {
+        IKeeper? temporary = null;
+        if (keeper is not null) keeper.Reconnect();
+        else
+        {
+            var running = server;
+            temporary = services.MakeKeeper(target, store.Load<string>(StoreKeys.TvKey),
+                new Dictionary<string, string> { ["server"] = ServerAddress(target) }, () => running.ConnectedClients > 0,
+                moved => post(() => TvMoved(moved)), key => post(() => store.Save(StoreKeys.TvKey, key)));
+            temporary.Start(TimeSpan.FromSeconds(5));
+        }
+        OpeningTvAppForTest = true;
+        try
+        {
+            var deadline = DateTime.UtcNow + TestTvWait;
+            while (server.ConnectedClients == 0 && DateTime.UtcNow < deadline) await Task.Delay(250);
+        }
+        finally
+        {
+            temporary?.Stop();
+            OpeningTvAppForTest = false;
+        }
     }
 
     /// <summary>
@@ -1284,7 +1393,7 @@ public sealed class AppController : INotifyPropertyChanged, IDisposable
         TvApp = TvAppState.Unknown;
         Step = OnboardingStep.Welcome;
         Changed(nameof(HasAccount), nameof(Console), nameof(ConsoleKind), nameof(ConsoleKindLocked), nameof(IsXbox), nameof(ConsoleTitle), nameof(HasXboxAccount),
-            nameof(SelectedXboxConsole), nameof(StepCount), nameof(StepNumber), nameof(Ps5StatusText), nameof(Tv), nameof(HasTv), nameof(NeedsTv), nameof(CanStart), nameof(HasLoginPasscode));
+            nameof(SelectedXboxConsole), nameof(StepCount), nameof(StepNumber), nameof(Ps5StatusText), nameof(Tv), nameof(CanReinstallTvApp), nameof(HasTv), nameof(NeedsTv), nameof(CanStart), nameof(HasLoginPasscode));
     }
 
     /// <summary>İkinci hesabın PS5 giriş şifresi şifreli depoda kayıtlı mı (şifrenin kendisi arayüze dönmez).</summary>
@@ -1602,7 +1711,11 @@ public sealed class AppController : INotifyPropertyChanged, IDisposable
             DisconnectKind.RegistrationInvalid => text["The PS5 didn't accept this pairing. Pair the PS5 again with the second account in Settings."],
             // Eskiden ağ hatası, bulunamayan PS5 ve diğer nedenler hep yalnız "Yeniden bağlanılıyor…" idi.
             DisconnectKind.NotFound => text.Format("PS5 not found at %@. Make sure it is on and on the same network. Reconnecting…", detail ?? "?"),
-            DisconnectKind.Network => text["Can't reach the PS5. Reconnecting…"],
+            // Kablosuz ağda akış sık kopuyordu (GitHub #388, #401): yeniden bağlanılır, kalıcı çözüm kablodur.
+            DisconnectKind.Network => text["Lost the connection to the PS5. Reconnecting… If this keeps happening, connect the PS5 to the router with a cable."],
+            // 0x80108b12: PS5'te Uzaktan Oynatma kapalı (GitHub #9). Ayar açılınca yeniden denemede bağlanılır.
+            DisconnectKind.Rejected when detail == ApplicationReasons.RemotePlayDisabled =>
+                text.Format("Remote Play is turned off on the PS5 (code %@). On the PS5, go to Settings › System › Remote Play and turn on Enable Remote Play.", detail),
             // Eskiden "Yeniden bağlanılıyor… (Unknown Session Request Error)" görünüyordu (GitHub #33, #202).
             DisconnectKind.Rejected when !string.IsNullOrEmpty(detail) => text.Format("The PS5 rejected the connection (code %@). Another Remote Play app (PS Remote Play) may be open, or the PS5 may be in another session. Close PS Remote Play, restart the PS5, then try again.", detail),
             DisconnectKind.Rejected => text["The PS5 didn't start the session. Another Remote Play app (PS Remote Play) may be open, or the PS5 may be in another session. Close PS Remote Play, restart the PS5, then try again."],
@@ -1968,6 +2081,7 @@ public sealed class AppController : INotifyPropertyChanged, IDisposable
         {
             ShowSpeakerNames = settings.ShowSpeakerNames,
             SkipsTurkish = settings.TargetLanguage == "tr",
+            WatchSubtitleBackground = settings.WatchSubtitleBackground,
         };
         built.MetricsReady += metrics => post(() => MetricsText = metrics.Summary(text));
         built.PairShown += (source, translation) =>
@@ -2026,6 +2140,7 @@ public sealed class AppController : INotifyPropertyChanged, IDisposable
         }
         regionWatcher.PackLookup = PacksActive ? services.FindInPacks : null;
         regionWatcher.SkipsTurkish = settings.TargetLanguage == "tr";
+        regionWatcher.Game = () => gameSense.Current?.Name;
     }
 
     // --- Geçmiş ---
@@ -2085,7 +2200,8 @@ public sealed class AppController : INotifyPropertyChanged, IDisposable
         {
             if (store.Load<string>(storeKey) is not { Length: > 0 } key) return local;
             online = engine.Provider() is { } provider
-                ? services.MakeAiTranslator(provider, key, provider.Model(settings.ModelFor(provider)).Id, fallback, game, settings.AiInstruction)
+                ? services.MakeAiTranslator(provider, key, provider.Model(settings.ModelFor(provider)).Id, fallback, game, settings.AiInstruction,
+                    settings.GeminiPaidTier && provider == AiProvider.Gemini)
                 : services.MakeOnlineTranslator(key, fallback);
         }
         if (online is null) return local;
@@ -2330,13 +2446,28 @@ public sealed class AppController : INotifyPropertyChanged, IDisposable
     /// <paramref name="near"/> adresine (TV) ulaşan bu bilgisayar adresi; TV adresi bilinmiyorsa (null ya da geçersiz)
     /// Wi-Fi/Ethernet adresi. TV adresi biliniyorsa işletim sisteminin TV'ye çıkacağı bağdaştırıcının adresi önce gelir
     /// (birden çok bağdaştırıcıda doğru kaynak adres, #343). VPN ve sanal bağdaştırıcılar ancak başka adres yoksa seçilir
-    /// (<see cref="LocalNetwork.ChooseComputerAddress(IReadOnlyList{LocalNetwork.AdapterAddress}, IPAddress?, IPAddress?)"/>).
+    /// (<see cref="LocalNetwork.ChooseComputerAddress(IReadOnlyList{LocalNetwork.AdapterAddress}, IPAddress?, IPAddress?, IPAddress?)"/>).
+    /// TV adresi bilinmiyorsa internete çıkılan bağdaştırıcının (varsayılan yol) adresi önce gelir.
     /// </summary>
     public static string? LocalAddress(string? near)
     {
         IPAddress? target = IPAddress.TryParse(near, out var parsed) && parsed.AddressFamily == AddressFamily.InterNetwork ? parsed : null;
         var route = target is null ? null : LocalNetwork.RouteSourceAddress(target);
-        return LocalNetwork.ChooseComputerAddress(LocalNetwork.Ipv4Adapters(), target, route);
+        var defaultRoute = target is null ? LocalNetwork.DefaultRouteSourceAddress() : null;
+        return LocalNetwork.ChooseComputerAddress(LocalNetwork.Ipv4Adapters(), target, route, defaultRoute);
+    }
+
+    /// <summary>
+    /// Samsung kurulumunda Host PC IP için gösterilen adresin dışındaki ev ağı adresleri (Wi-Fi ve Ethernet ikisi de
+    /// bağlıysa ya da birden çok ağ varsa). TV gösterilen adresi kabul etmezse bunlar denenir.
+    /// </summary>
+    public string[] OtherComputerAddresses
+    {
+        get
+        {
+            var chosen = ComputerAddress;
+            return [.. LocalNetwork.HomeAddresses(LocalNetwork.Ipv4Adapters()).Where(a => a != chosen)];
+        }
     }
 
     // --- Windows Güvenlik Duvarı ---
@@ -2573,7 +2704,7 @@ public sealed class AppController : INotifyPropertyChanged, IDisposable
             if (isRunning && settings.OcrEngine == OcrEngine.Advanced) MakePipeline();
         }
         catch (Exception error) when (error is HttpRequestException or IOException or InvalidDataException or TaskCanceledException
-                                          or UnauthorizedAccessException)
+                                          or TimeoutException or UnauthorizedAccessException)
         {
             AdvancedOcrError = error.Message;
         }
@@ -2610,7 +2741,7 @@ public sealed class AppController : INotifyPropertyChanged, IDisposable
             if (settings.Dubbing.Enabled && isRunning) MakeDubber()?.Prepare();
         }
         catch (Exception error) when (error is HttpRequestException or IOException or InvalidDataException or TaskCanceledException
-                                          or UnauthorizedAccessException)
+                                          or TimeoutException or UnauthorizedAccessException)
         {
             DubbingError = error.Message;
         }
@@ -2725,3 +2856,20 @@ public enum ExtraRegionOutcome { Shown, NoText, NotConfigured, NotRunning, Busy,
 
 /// <summary>"Ekranı çevir"in sonucu; <see cref="Cleared"/>: TV'deki çeviriler kaldırıldı ya da süren iş iptal edildi.</summary>
 public enum ScreenOutcome { Shown, NoText, Cleared, NotRunning, TranslatorUnavailable, Failed }
+
+/// <summary>Ağda hata ayıklaması açık bulunan Android TV'ler arasından kurulumun gideceği TV (Mac: AndroidTVPick).</summary>
+public static class AndroidTvPick
+{
+    /// <summary>Bulunan adresler (boşlar ve tekrarlar atılır, sıra korunur).</summary>
+    public static IReadOnlyList<string> Hosts(IEnumerable<string> found) => [.. found.Where(h => h.Length > 0).Distinct()];
+
+    /// <summary><paramref name="preferred"/>: seçilen ya da kayıtlı TV adresi (önce gelen önce). Bulunanlar arasındaysa o; tek TV
+    /// bulunduysa odur; hiç yoksa ya da birden çoksa (kullanıcıya sorulur) null.</summary>
+    public static string? Pick(IEnumerable<string> found, IEnumerable<string?> preferred)
+    {
+        var hosts = Hosts(found);
+        foreach (var host in preferred)
+            if (!string.IsNullOrEmpty(host) && hosts.Contains(host)) return host;
+        return hosts.Count == 1 ? hosts[0] : null;
+    }
+}

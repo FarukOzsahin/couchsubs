@@ -250,6 +250,8 @@ public sealed record UserSettings
     public int CpuTranslationThreads { get; init; } = CpuThreadOptions.Default;
     /// <summary>Değişmeyen altyazı bölgesinde tam OCR okumasını en fazla iki kare yeniden kullan.</summary>
     public bool FastSubtitleDetection { get; init; }
+    /// <summary>Yalnız GTA 6'nın lacivert altyazı zemini üstündeki yazıyı oku. Varsayılan kapalı.</summary>
+    public bool WatchSubtitleBackground { get; init; }
     /// <summary>Altyazı okuyucusu. Gelişmiş seçili ama modeli inmemişse Windows'unki kullanılır.</summary>
     public OcrEngine OcrEngine { get; init; } = OcrEngine.Windows;
     public DubbingSettings Dubbing { get; init; } = new();
@@ -262,6 +264,8 @@ public sealed record UserSettings
     public TranslationEngine OnlineEngine { get; init; } = TranslationEngine.DeepL;
     /// <summary>Seçili yapay zekâ modelleri (listedeki kimlikler; bkz. <see cref="AiProviders.Models"/>).</summary>
     public string GeminiModel { get; init; } = AiProvider.Gemini.DefaultModel().Id;
+    /// <summary>Explicit opt-in: bypass the free-tier client-side Gemini RPM for a billed key.</summary>
+    public bool GeminiPaidTier { get; init; }
     public string OpenAiModel { get; init; } = AiProvider.OpenAi.DefaultModel().Id;
     public string ClaudeModel { get; init; } = AiProvider.Claude.DefaultModel().Id;
     /// <summary>
@@ -383,8 +387,15 @@ public sealed record UserSettings
         _ => this,
     };
 
-    /// <summary>Sürekli okunan ek bölgeler (açık ve "Sürekli oku" seçili olanlar).</summary>
-    public IReadOnlyList<WatchedArea> WatchedAreas() =>
+    /// <summary>
+    /// Altyazı alanı Tam ekran: sürekli okunan ek bölgeler okunmaz (ekranın tamamı zaten okunuyor, aynı yazı ikinci kez
+    /// çevrilirdi). Bölgelerin ayarı değişmez; başka bir alan seçilince eskisi gibi okunurlar. Tuşla tek seferlik okuma
+    /// etkilenmez.
+    /// </summary>
+    public bool ExtraAreasPausedByFullScreen => AreaPreset == AreaPreset.Full;
+
+    /// <summary>Sürekli okunan ek bölgeler (açık ve "Sürekli oku" seçili olanlar); Tam ekranda hiçbiri (Mac: activeExtraAreas).</summary>
+    public IReadOnlyList<WatchedArea> WatchedAreas() => ExtraAreasPausedByFullScreen ? [] :
         [.. Enumerable.Range(1, ExtraRegionCount)
             .Where(ExtraLive)
             .Select(slot => ExtraRegion(slot) is { } region ? new WatchedArea("area" + slot, "Area " + slot, region) : null)
@@ -592,13 +603,19 @@ public interface IAppServices
     /// vermezse Info null olur; kurulum yine denenir.
     /// </summary>
     Task<SamsungPreflight> CheckSamsungAsync(string host) => Task.FromResult(new SamsungPreflight(null, null));
-    /// <summary>TV'deki sürüme bakar, eksik ya da eskiyse kurar; TV'deki sürümü ve kurulup kurulmadığını döner.</summary>
-    Task<(string Version, bool Installed)> InstallSamsungAppAsync(string host, BundledTvApp app, Action<TvInstallEvent> onEvent);
+    /// <summary>
+    /// Eksikse ya da eskiyse imzalayıp kurar; TV'deki sürümü ve kurup kurmadığını döner. <paramref name="openIfInstalled"/>:
+    /// uygulama güncelse de TV'de açılır ("TV uygulamasını yeniden kur").
+    /// </summary>
+    Task<(string Version, bool Installed)> InstallSamsungAppAsync(string host, BundledTvApp app, bool openIfInstalled, Action<TvInstallEvent> onEvent);
     Task<bool> IsAndroidDebugOnAsync(string host);
     /// <summary>Ağda ADB'si açık cihazlar.</summary>
     Task<IReadOnlyList<string>> ScanAndroidTvsAsync();
-    /// <summary>Eksikse ya da eskiyse kurar; TV'deki sürümü döner.</summary>
-    Task<string> InstallAndroidAppAsync(string host, BundledTvApp app, Action<TvInstallEvent> onEvent);
+    /// <summary>
+    /// Eksikse ya da eskiyse kurar; TV'deki sürümü döner. <paramref name="openIfInstalled"/>: uygulama güncelse de TV'de
+    /// açılır ("TV uygulamasını yeniden kur").
+    /// </summary>
+    Task<string> InstallAndroidAppAsync(string host, BundledTvApp app, bool openIfInstalled, Action<TvInstallEvent> onEvent);
     /// <summary>Oyun dili için yazı tanıyıcı; bilgisayarda hiç OCR dili yoksa null.</summary>
     ITextReader? MakeReader(string language);
     /// <summary>
@@ -623,7 +640,7 @@ public interface IAppServices
     /// </summary>
     /// <paramref name="instruction"/>: Ayarlardaki "Ek talimat"; boşsa sistem talimatı değişmez.
     ITextTranslator? MakeAiTranslator(AiProvider provider, string key, string model, ITextTranslator? fallback, Func<string?>? game,
-                                      string? instruction = null) => null;
+                                      string? instruction = null, bool paidTier = false) => null;
     /// <summary>Yapay zekâ anahtarını örnek bir satırı çevirerek dener.</summary>
     Task<AiTestResult> TestAiKeyAsync(AiProvider provider, string key, string model) => Task.FromResult(new AiTestResult(OnlineKeyState.Unreachable));
     /// <summary>Yerel model (Ollama, LM Studio) çevirmeni; anahtar boş olabilir. Bu derlemede yoksa null.</summary>
@@ -671,13 +688,16 @@ public sealed record TvInstallEvent(TvInstallEventKind Kind, Uri? Url = null, st
 /// SignIn: Samsung sertifikası için tarayıcıda Samsung hesabıyla giriş bekleniyor. ApproveOnTv: Android TV ekranında
 /// hata ayıklama izni bekleniyor.
 /// </summary>
-public enum TvAppKind { Unknown, Working, UpToDate, DevModeOff, NeedsPassphrase, Failed, SignIn, ApproveOnTv }
+/// <summary><c>PressInstallOnTv</c>: Android TV'de Google Play sayfası açıldı, kullanıcı TV'de Yükle'ye basmalı.
+/// <c>ChooseAndroidTv</c>: ağda hata ayıklaması açık birden çok Android TV var; kurulumun gideceği TV kullanıcıya sorulur (#425).</summary>
+public enum TvAppKind { Unknown, Working, UpToDate, DevModeOff, NeedsPassphrase, Failed, SignIn, ApproveOnTv, PressInstallOnTv, ChooseAndroidTv }
 
 /// <summary>TV uygulamasının kurulum durumu.</summary>
 /// <param name="HostPcIp">HostPcMismatch'te TV'deki "Host PC IP".</param>
 /// <param name="ComputerAddress">HostPcMismatch'te TV'nin göreceği bu bilgisayar adresi.</param>
+/// <param name="Hosts">ChooseAndroidTv'de bulunan TV'lerin adresleri.</param>
 public sealed record TvAppState(TvAppKind Kind, string? Version = null, DevModeError? Error = null, Uri? Url = null, string? Reason = null,
-    string? HostPcIp = null, string? ComputerAddress = null)
+    string? HostPcIp = null, string? ComputerAddress = null, IReadOnlyList<string>? Hosts = null)
 {
     public static readonly TvAppState Unknown = new(TvAppKind.Unknown);
 }

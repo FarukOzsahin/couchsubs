@@ -89,6 +89,7 @@ public final class SubtitlePipeline {
     }
 
     private let reader: TextReader
+    private let readQueue: ReadQueue
     private let translator: TextTranslator
     private let server: SubtitleSending
     private let now: () -> Int
@@ -112,6 +113,7 @@ public final class SubtitlePipeline {
     private var session = 0
     /// Son okunan satırlar; kare değişmediyse yeniden okunmaz, bunlar kullanılır.
     private var lastReading = Reading.empty
+    private var stickyRows = StickyRows()
     /// Son yazı tanımanın süresi (ms); kare değişmeyip okuma yeniden kullanılınca da o okumanın süresi geçerlidir.
     private var lastReadMs: Int?
     /// İşlenen karenin okunması (satır kararlı olunca isteğe geçer).
@@ -140,6 +142,8 @@ public final class SubtitlePipeline {
     /// Hedef dil Türkçe: yüksek güvenle Türkçe olan satır (`TurkishText.isSure`) çevirmene gönderilmez (#289). Uygulama
     /// hedef dil Türkçe değilse kapatır.
     public var skipsTurkish = true
+    /// Yalnız GTA 6 altyazı renginin üstündeki OCR satırlarını oku.
+    public var watchSubtitleBackground = false
     /// Hiçbir pakette bulunmayan kararlı satır (ortak havuz için).
     public var onPackMiss: ((String) -> Void)?
     /// Son gösterilen çevirinin nereden geldiği: "paket" ya da "motor" (günlük ve sayım için).
@@ -159,9 +163,11 @@ public final class SubtitlePipeline {
 
     /// `scheduler`: varsayılanı her kareyi okur; uygulama gereksiz okumaları atlayan planı verir.
     /// `clock`: milisaniye saati; testlerde sahtesi verilir.
+    /// `readQueue`: okumaların sırası (süreç genelinde tek); testlerde kısa süreli bir sıra verilir.
     public init(reader: TextReader, translator: TextTranslator, server: SubtitleSending, scheduler: ReadScheduler = .always,
-         clock: @escaping () -> Int = SubtitleStabilizer.uptimeMs) {
+         clock: @escaping () -> Int = SubtitleStabilizer.uptimeMs, readQueue: ReadQueue = .shared) {
         self.reader = reader
+        self.readQueue = readQueue
         self.translator = translator
         self.server = server
         self.scheduler = scheduler
@@ -191,6 +197,7 @@ public final class SubtitlePipeline {
         let startedSession = session
         // Yazı tanıma uzun sürebilir; arayüz takılmasın diye ana iş parçacığının dışında yapılır.
         let reader = self.reader
+        let watchSubtitleBackground = self.watchSubtitleBackground
         let (area, signature) = await Task.detached(priority: .userInitiated) {
             let area = RegionCropper.crop(frame, to: region)
             return (area, RegionCropper.signature(of: area))
@@ -201,9 +208,17 @@ public final class SubtitlePipeline {
             break
         case .read(let deep):
             let started = now()
-            let result = await Task.detached(priority: .userInitiated) {
-                Result { try reader.readLines(area, deep: deep) }
-            }.value
+            // Okuma kendi sırasında (`ReadQueue`) yapılır, Swift havuzunu tutmaz; takılırsa süre dolunca kare atlanır (#507).
+            let result: Result<Reading, Error>
+            do {
+                result = .success(try await readQueue.run {
+                    let reading = try reader.readLines(area, deep: deep)
+                    return watchSubtitleBackground ? SubtitleBackground.filter(reading, in: area) : reading
+                })
+            } catch {
+                result = .failure(error)
+                if case ReadQueueError.timedOut(let ms) = error { log("okuma \(ms) ms'de bitmedi; kare atlandı") }
+            }
             guard session == startedSession else {
                 log("eski okuma \(now() - started) ms sonra bitti, hat sıfırlanmıştı; atıldı")
                 return
@@ -217,7 +232,10 @@ public final class SubtitlePipeline {
         // Yazı tanımanın uydurduğu sözcük çöpleri ("ou$3e") de çevirmene gitmez.
         // Alandaki menü ve köşe göstergeleri de altyazı değildir; yalnız altyazı bloğu çevrilir ve kutusu ona göre olur.
         let place = TextBox(left: region.left, top: region.top, right: region.right, bottom: region.bottom)
-        let reading = lastReading.withoutButtonPrompts().withoutOcrNoise().joiningRows().subtitleBlock(in: place)
+        // Konuşma değişirken sabit duran görev/HUD satırı ("Get in the sea plane", GTA 6) altyazı bloğuna katılmaz.
+        let rows = stickyRows.filter(lastReading.withoutButtonPrompts().withoutOcrNoise().joiningRows(), at: now())
+        for row in stickyRows.newlySticky { log("sabit satır: \(SubtitleLog.excerpt(row)) görev/HUD yazısı sayıldı, çevrilmiyor") }
+        let reading = rows.subtitleBlock(in: place)
         currentRead = ReadInfo(capturedAt: captured, ocrMs: lastReadMs, confidence: reading.confidence)
         let box = reading.box?.placed(in: place).centeredOnScreen()
         if !sawText, !reading.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
@@ -640,10 +658,11 @@ public final class SubtitlePipeline {
     /// Okumanın hemen başlaması için modelleri önceden yükler; ilk okuma yoksa saniyelerce sürer.
     public func warmUp() {
         let reader = self.reader
+        let readQueue = self.readQueue
         Task.detached(priority: .utility) {
             let context = CGContext(data: nil, width: 64, height: 32, bitsPerComponent: 8, bytesPerRow: 0,
                                     space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
-            if let image = context?.makeImage() { _ = try? reader.read(image) }
+            if let image = context?.makeImage() { _ = try? await readQueue.run { try reader.read(image) } }
         }
         let translator = self.translator
         Task { await translator.warmUp() }
@@ -668,6 +687,7 @@ public final class SubtitlePipeline {
         lastReading = .empty
         lastReadMs = nil
         scheduler.reset()
+        stickyRows.reset()
         if stabilizer.reset() == .clear { server.clear() }
     }
 }

@@ -154,7 +154,7 @@ CouchSubs is an independent app. It is not affiliated with, endorsed or sponsore
   "Bu oyunların Türkçe yaması hazır" listesi. Paketler her derlemede uygulamayla gelir (`copyCouchSubsPacks`), yenileri
   `server/packs`'ten iner. Yeni paket eklenince iki açıklama da güncellenmeli.
 - Remote Play yalnız ev ağında: `couchsubs-jni.c`'de `holepunch_info = NULL` (internet üzerinden bağlantı yok).
-- Android 8+, 64 bit: `minSdk 26`, `abiFilters arm64-v8a`.
+- Android 8+, 64 ve 32 bit ARM: `minSdk 26`, `abiFilters arm64-v8a, armeabi-v7a`.
 - Çeviri motorları: `EngineChoice { FREE, DEEPL, GEMINI, OPENAI, CLAUDE }`; ücretsiz motor `MlKitTranslator` (model
   ~30 MB, ilk kullanımda iner).
 - TV'de gösterme: telefon ev ağında 8787 portunda altyazı sunucusu açar, TV uygulaması telefonu bulur. LG/Samsung TV
@@ -223,6 +223,8 @@ URL: `https://couchsubs.enmeraapps.com/gizlilik` (canlı, HTTP 200). Sayfada And
 "Uygulamanızda reklam var mı?" → **Hayır.** (Doğrulandı: AdMob/UMP bağımlılığı yok; `AD_ID`,
 `ACCESS_ADSERVICES_AD_ID` ve `ACCESS_ADSERVICES_ATTRIBUTION` izinleri manifestte `tools:node="remove"` ile çıkarılıyor.
 Meta App Events reklam göstermez; bkz. §4.6.)
+
+> **Not (19 Kas 2026):** Mobil tanıtım penceresi (Enmera'nın kendi ürünleri ve sponsor bağlantıları, `promo.json`) yayına girince Play'deki "Reklam içerir" beyanı yeniden değerlendirilecek.
 
 ### 4.3 Uygulama erişimi
 

@@ -151,7 +151,7 @@ internal sealed class FakeServices : IAppServices
         return Task.FromResult(AiTest);
     }
     public ITextTranslator? MakeAiTranslator(AiProvider provider, string key, string model, ITextTranslator? fallback, Func<string?>? game,
-                                             string? instruction = null)
+                                             string? instruction = null, bool paidTier = false)
     {
         AiTranslators.Add((provider, key, model));
         AiInstructions.Add(instruction);
@@ -297,9 +297,12 @@ internal sealed class FakeServices : IAppServices
     public Task<SamsungPreflight> CheckSamsungAsync(string host) => Task.FromResult(SamsungCheck);
     /// <summary>Samsung TV'de kurulu sürüm (sahte TV'nin vd_applist'i); null: uygulama yok.</summary>
     public string? SamsungOnTv { get; set; }
-    public Task<(string Version, bool Installed)> InstallSamsungAppAsync(string host, BundledTvApp app, Action<TvInstallEvent> onEvent)
+    /// <summary>Her Samsung denetiminde "güncelse de aç" istendi mi.</summary>
+    public List<bool> SamsungOpenRequests { get; } = [];
+    public Task<(string Version, bool Installed)> InstallSamsungAppAsync(string host, BundledTvApp app, bool openIfInstalled, Action<TvInstallEvent> onEvent)
     {
         TvCalls++;
+        SamsungOpenRequests.Add(openIfInstalled);
         if (SamsungOnTv is { } onTv && !DevModeInstaller.IsNewer(app.Version, onTv)) return Task.FromResult((onTv, false));
         Events.ForEach(onEvent);
         if (InstallError is { } error) throw new DevModeException(error, InstallDetail);
@@ -313,8 +316,11 @@ internal sealed class FakeServices : IAppServices
         return Task.FromResult(AndroidHosts.Contains(host));
     }
     public Task<IReadOnlyList<string>> ScanAndroidTvsAsync() => Task.FromResult<IReadOnlyList<string>>([.. AndroidHosts]);
-    public Task<string> InstallAndroidAppAsync(string host, BundledTvApp app, Action<TvInstallEvent> onEvent)
+    /// <summary>Her Android kurulumunda "güncelse de aç" istendi mi.</summary>
+    public List<bool> AndroidOpenRequests { get; } = [];
+    public Task<string> InstallAndroidAppAsync(string host, BundledTvApp app, bool openIfInstalled, Action<TvInstallEvent> onEvent)
     {
+        AndroidOpenRequests.Add(openIfInstalled);
         Events.ForEach(onEvent);
         if (InstallError is { } error) throw new DevModeException(error);
         BrandInstalls.Add((TvBrand.AndroidTv, host));
@@ -356,6 +362,17 @@ public class AppControllerTests
 
     internal static AppController Make(FakeServices? services = null, MemoryStore? store = null, MemorySettings? settings = null, FakeSleep? sleep = null) =>
         new(services ?? new FakeServices(), store ?? new MemoryStore(), settings ?? new MemorySettings(), sleep ?? new FakeSleep(), Localizer.ForLanguage("en"), action => action());
+
+    [Fact]
+    public void PaidGeminiOptInIsOffByDefaultAndSurvivesSettingsSerialization()
+    {
+        var legacy = System.Text.Json.JsonSerializer.Deserialize<UserSettings>("{}")!;
+        Assert.False(legacy.GeminiPaidTier);
+        var optedIn = legacy with { GeminiPaidTier = true };
+        var restored = System.Text.Json.JsonSerializer.Deserialize<UserSettings>(
+            System.Text.Json.JsonSerializer.Serialize(optedIn))!;
+        Assert.True(restored.GeminiPaidTier);
+    }
 
     [Fact]
     public void FreshInstallStartsAtWelcome() => Assert.Equal(OnboardingStep.Welcome, Make().Step);
@@ -1045,6 +1062,19 @@ public class AppControllerRunTests
         Assert.Equal(OnboardingStep.Done, AppControllerTests.Make(store: store, settings: settings).Step);
     }
 
+    /// DM'de bildirildi: "Görüntü kaynağı" ayarı bulunamıyordu. Ana ekrandaki satır seçili kaynağı gösterir (Ayarlar'daki
+    /// seçeneklerle aynı ad); Xbox'ta seçim olmadığından satır yoktur.
+    [Fact]
+    public void PictureSourceTitleFollowsTheSelectedSource()
+    {
+        var controller = AppControllerTests.Make();
+        Assert.Equal("The PS5 (second account)", controller.PictureSourceTitle);
+        controller.Settings = controller.Settings with { FrameSource = FrameSource.RemotePlayWindow };
+        Assert.Equal("Remote Play window on this PC", controller.PictureSourceTitle);
+        controller.Settings = controller.Settings with { FrameSource = FrameSource.CaptureWindow };
+        Assert.Equal("OBS projector or game window", controller.PictureSourceTitle);
+    }
+
     /// Pencere modunda kurulmuş, sonra Ayarlar'da PS5 seçilmiş: "Hesabı bağla" görünür, sihirbaz ikinci hesap adımından açılır.
     [Fact]
     public void LinkAccountOpensWizardAtSecondAccount()
@@ -1172,6 +1202,45 @@ public class AppControllerRunTests
         Assert.Single(services.Streams);
         Assert.Single(services.Keepers);
         Assert.True(controller.IsRunning);
+        controller.Dispose();
+    }
+
+    // "TV'de test et": TV uygulaması bağlı değilse önce TV'de açılır (Samsung 65S95F'de TV'ye hiçbir şey gelmiyordu).
+    private static (AppController Controller, FakeServices Services) SamsungReady()
+    {
+        var services = new FakeServices();
+        var store = new MemoryStore();
+        store.Save(StoreKeys.AccountId, Enumerable.Repeat((byte)1, 8).ToArray());
+        store.Save(StoreKeys.Console, new RegisteredConsole("192.168.1.253", "PS5", Enumerable.Repeat((byte)0x31, 16).ToArray(), Enumerable.Repeat((byte)2, 16).ToArray()));
+        store.Save(StoreKeys.Tv, new LgTv("Samsung", "127.0.0.1", TvBrand.Samsung));
+        store.Save(StoreKeys.TvKey, "samsung-token");
+        var controller = AppControllerTests.Make(services, store);
+        controller.TestTvWait = TimeSpan.FromMilliseconds(300);
+        return (controller, services);
+    }
+
+    [Fact]
+    public async Task TestOnTvOpensTheTvAppWhenTranslationIsNotRunning()
+    {
+        var (controller, services) = SamsungReady();
+        await controller.SendTestSubtitleAsync();
+        var keeper = Assert.Single(services.Keepers);
+        // Geçici bekçi bekleme bitince kapanır; çeviri başlamadan TV'ye dokunmaya devam etmez.
+        Assert.False(keeper.Running);
+        Assert.False(controller.OpeningTvAppForTest);
+        controller.Dispose();
+    }
+
+    [Fact]
+    public async Task TestOnTvAsksTheRunningKeeperToOpenTheTvApp()
+    {
+        var (controller, services) = SamsungReady();
+        await controller.StartAsync();
+        var keeper = Assert.Single(services.Keepers);
+        await controller.SendTestSubtitleAsync();
+        Assert.Single(services.Keepers);
+        Assert.Equal(1, keeper.Reconnects);
+        Assert.True(keeper.Running);
         controller.Dispose();
     }
 
@@ -1608,7 +1677,13 @@ public class AppControllerRunTests
         Assert.Equal("Turn on your PS5", AppController.StatusText(SessionState.Disconnected(DisconnectKind.ConsoleAsleep), true, text));
         Assert.Equal("Remote Play is in use on another device", AppController.StatusText(SessionState.Disconnected(DisconnectKind.InUse), true, text));
         Assert.Equal("The PS5 refused the connection. Set up the PS5 again.", AppController.StatusText(SessionState.Disconnected(DisconnectKind.Refused), true, text));
-        Assert.Equal("Can't reach the PS5. Reconnecting…", AppController.StatusText(SessionState.Disconnected(DisconnectKind.Network), true, text));
+        Assert.Equal("Lost the connection to the PS5. Reconnecting… If this keeps happening, connect the PS5 to the router with a cable.",
+            AppController.StatusText(SessionState.Disconnected(DisconnectKind.Network), true, text));
+        Assert.Equal("PS5 ile bağlantı koptu, yeniden bağlanılıyor… Sık oluyorsa PS5'i modeme kabloyla bağlayın.",
+            AppController.StatusText(SessionState.Disconnected(DisconnectKind.Network), true, Localizer.ForLanguage("tr")));
+        // 0x80108b12: PS5'te Uzaktan Oynatma kapalı (GitHub #9); genel "başka Remote Play açık olabilir" metni yanıltıyordu.
+        Assert.Equal("PS5'te Uzaktan Oynama kapalı (kod 0x80108b12). PS5'te Ayarlar › Sistem › Uzaktan Oynama'ya gidip Uzaktan Oynama'yı Etkinleştir'i açın.",
+            AppController.StatusText(SessionState.Disconnected(DisconnectKind.Rejected, ApplicationReasons.RemotePlayDisabled), true, Localizer.ForLanguage("tr")));
         Assert.Equal("The PS5 didn't accept this pairing. Pair the PS5 again with the second account in Settings.",
             AppController.StatusText(SessionState.Disconnected(DisconnectKind.RegistrationInvalid), true, text));
         Assert.Equal("PS5 not found at 192.168.1.70. Make sure it is on and on the same network. Reconnecting…",
@@ -2013,6 +2088,173 @@ public class TvAppInstallTests
         Assert.Equal(new TvAppState(TvAppKind.UpToDate, "0.7.0"), controller.TvApp);
         Assert.Equal("192.168.1.40", controller.Tv?.Host);
         Assert.Equal("192.168.1.40", store.Load<LgTv>(StoreKeys.Tv)?.Host);
+    }
+
+    /// <summary>Aynı ağda iki Android TV: kurulum ilk bulunana gitmez, TV sorulur; seçilen TV'ye kurulur ve hatırlanır (#425).</summary>
+    [Fact]
+    public async Task SeveralAndroidTvsAreAskedAndTheChosenOneIsInstalled()
+    {
+        var services = new FakeServices();
+        services.Bundled[TvBrand.AndroidTv] = new BundledTvApp("couchsubs-androidtv_0.7.0.apk", "0.7.0");
+        services.AndroidHosts.AddRange(["192.168.1.105", "192.168.1.106"]);
+        var store = new MemoryStore();
+        var controller = Make(services, store);
+        await controller.PairAsync(new LgTv("Android TV", "", TvBrand.AndroidTv));
+        Assert.Equal(TvAppKind.ChooseAndroidTv, controller.TvApp.Kind);
+        Assert.Equal(["192.168.1.105", "192.168.1.106"], controller.TvApp.Hosts);
+        Assert.Empty(services.BrandInstalls);
+
+        await controller.ChooseAndroidTvAsync("192.168.1.106");
+        Assert.Equal(new TvAppState(TvAppKind.UpToDate, "0.7.0"), controller.TvApp);
+        Assert.Equal([(TvBrand.AndroidTv, "192.168.1.106")], services.BrandInstalls);
+        Assert.Equal("192.168.1.106", store.Load<LgTv>(StoreKeys.Tv)?.Host);
+    }
+
+    [Fact]
+    public void AndroidTvPickPrefersTheKnownTvAndOtherwiseAsks()
+    {
+        Assert.Equal("192.168.1.105", AndroidTvPick.Pick(["192.168.1.105"], []));
+        Assert.Null(AndroidTvPick.Pick([], ["192.168.1.105"]));
+        Assert.Null(AndroidTvPick.Pick(["192.168.1.105", "192.168.1.106"], [null, ""]));
+        Assert.Equal("192.168.1.106", AndroidTvPick.Pick(["192.168.1.105", "192.168.1.106"], [null, "192.168.1.106"]));
+        Assert.Null(AndroidTvPick.Pick(["192.168.1.105", "192.168.1.106"], ["192.168.1.7"]));
+        Assert.Equal("192.168.1.105", AndroidTvPick.Pick(["192.168.1.105", "192.168.1.105"], []));
+    }
+
+    private static readonly BundledTvApp AndroidApp = new("couchsubs-androidtv_0.7.0.apk", "0.7.0");
+
+    // #352, #389: TV'den kaldırılan uygulama; TV sihirbazda yeniden seçilince adres boşalıyor, kayıtlı sürüm kalıyordu.
+    // Kart "hazır" diyor, ağda TV aranmıyor, kurulum hiç denenmiyordu; ana ekran "TV uygulaması bekleniyor"da kalıyordu.
+    [Fact]
+    public async Task ReselectedAndroidTvWithARememberedVersionIsCheckedOnTheTv()
+    {
+        var services = new FakeServices();
+        services.Bundled[TvBrand.AndroidTv] = AndroidApp;
+        services.AndroidHosts.Add("192.168.1.40");
+        var store = new MemoryStore();
+        var controller = Make(services, store);
+        await controller.PairAsync(new LgTv("Android TV", "", TvBrand.AndroidTv));
+        Assert.Single(services.BrandInstalls);
+        Assert.Equal("0.7.0", store.Load<string>(StoreKeys.TvAppVersion));
+
+        // Uygulama TV'den kaldırıldı; kullanıcı TV'yi sihirbazda yeniden seçti.
+        await controller.PairAsync(new LgTv("Android TV", "", TvBrand.AndroidTv));
+        Assert.Equal(2, services.BrandInstalls.Count);
+        Assert.Equal("192.168.1.40", services.BrandInstalls[1].Host);
+        Assert.Equal(new TvAppState(TvAppKind.UpToDate, "0.7.0"), controller.TvApp);
+    }
+
+    [Fact]
+    public async Task ReselectedAndroidTvThatCannotBeFoundShowsTheDebuggingSteps()
+    {
+        var services = new FakeServices();
+        services.Bundled[TvBrand.AndroidTv] = AndroidApp;
+        var store = new MemoryStore();
+        var controller = Make(services, store);
+        store.Save(StoreKeys.TvAppVersion, "0.7.0");
+        await controller.PairAsync(new LgTv("Android TV", "", TvBrand.AndroidTv));
+        await controller.RefreshTvAppAsync();
+        Assert.Equal(TvAppKind.DevModeOff, controller.TvApp.Kind);
+    }
+
+    [Fact]
+    public async Task KnownAndroidTvWithDebuggingOffKeepsTheRememberedVersion()
+    {
+        var services = new FakeServices();
+        services.Bundled[TvBrand.AndroidTv] = AndroidApp;
+        var store = new MemoryStore();
+        var controller = Make(services, store);
+        await controller.PairAsync(new LgTv("Android TV", "", TvBrand.AndroidTv));
+        controller.TvMoved(new LgTv("Android TV", "192.168.1.40", TvBrand.AndroidTv));
+        store.Save(StoreKeys.TvAppVersion, "0.7.0");
+        await controller.RefreshTvAppAsync();
+        Assert.Equal(new TvAppState(TvAppKind.UpToDate, "0.7.0"), controller.TvApp);
+        Assert.Empty(services.BrandInstalls);
+        // TV uygulaması bağlı değil: "yeniden kur" görünür.
+        Assert.True(controller.CanReinstallTvApp);
+    }
+
+    [Fact]
+    public async Task ReinstallForgetsTheVersionChecksTheTvAndOpensTheApp()
+    {
+        var services = new FakeServices();
+        services.Bundled[TvBrand.AndroidTv] = AndroidApp;
+        services.AndroidHosts.Add("192.168.1.40");
+        var store = new MemoryStore();
+        var controller = Make(services, store);
+        await controller.PairAsync(new LgTv("Android TV", "", TvBrand.AndroidTv));
+        Assert.Equal([false], services.AndroidOpenRequests);
+
+        await controller.ReinstallTvAppAsync();
+        Assert.Equal([false, true], services.AndroidOpenRequests);
+        Assert.Equal(new TvAppState(TvAppKind.UpToDate, "0.7.0"), controller.TvApp);
+
+        // "Açılsın" isteği bir kerelik: sonraki denetim uygulamayı açmaz.
+        await controller.RefreshTvAppAsync();
+        Assert.Equal([false, true, false], services.AndroidOpenRequests);
+    }
+
+    [Fact]
+    public async Task SamsungReinstallOpensTheCurrentAppOnTheTv()
+    {
+        // Samsung'da düğme güncel uygulamayı açmıyordu: TV uygulaması kapalı kalıyor, altyazı gelmiyordu.
+        var services = new FakeServices { SamsungDevMode = true, SamsungOnTv = "0.7.0" };
+        services.Bundled[TvBrand.Samsung] = SamsungApp;
+        var store = new MemoryStore();
+        var controller = Make(services, store);
+        await controller.PairAsync(Samsung);
+        Assert.Equal([false], services.SamsungOpenRequests);
+
+        await controller.ReinstallTvAppAsync();
+        Assert.Equal([false, true], services.SamsungOpenRequests);
+        Assert.Empty(services.BrandInstalls);
+        Assert.Equal(new TvAppState(TvAppKind.UpToDate, "0.7.0"), controller.TvApp);
+
+        // "Açılsın" isteği bir kerelik.
+        await controller.RefreshTvAppAsync();
+        Assert.Equal([false, true, false], services.SamsungOpenRequests);
+    }
+
+    [Fact]
+    public async Task ReinstallWithoutDebuggingShowsTheDebuggingSteps()
+    {
+        var services = new FakeServices();
+        services.Bundled[TvBrand.AndroidTv] = AndroidApp;
+        var store = new MemoryStore();
+        var controller = Make(services, store);
+        await controller.PairAsync(new LgTv("Android TV", "", TvBrand.AndroidTv));
+        controller.TvMoved(new LgTv("Android TV", "192.168.1.40", TvBrand.AndroidTv));
+        store.Save(StoreKeys.TvAppVersion, "0.7.0");
+        await controller.ReinstallTvAppAsync();
+        Assert.Null(store.Load<string>(StoreKeys.TvAppVersion));
+        Assert.Equal(TvAppKind.DevModeOff, controller.TvApp.Kind);
+    }
+
+    [Fact]
+    public async Task OpenedPlayPageAsksToPressInstallOnTheTv()
+    {
+        var services = new FakeServices();
+        services.Bundled[TvBrand.AndroidTv] = AndroidApp;
+        services.AndroidHosts.Add("192.168.1.40");
+        var states = new List<TvAppKind>();
+        var controller = Make(services);
+        controller.PropertyChanged += (_, e) => { if (e.PropertyName == nameof(AppController.TvApp)) states.Add(controller.TvApp.Kind); };
+        services.Events.Add(new TvInstallEvent(TvInstallEventKind.Progress, Step: "play"));
+        await controller.PairAsync(new LgTv("Android TV", "", TvBrand.AndroidTv));
+        Assert.Contains(TvAppKind.PressInstallOnTv, states);
+        Assert.Equal(TvAppKind.UpToDate, controller.TvApp.Kind);
+    }
+
+    [Fact]
+    public async Task ReinstallIsOfferedOnlyForSamsungAndAndroidTv()
+    {
+        var services = new FakeServices();
+        services.Bundled[TvBrand.AndroidTv] = AndroidApp;
+        var controller = Make(services);
+        await controller.PairAsync(Tv);
+        Assert.False(controller.CanReinstallTvApp);
+        await controller.PairAsync(new LgTv("Android TV", "", TvBrand.AndroidTv));
+        Assert.True(controller.CanReinstallTvApp);
     }
 
     [Fact]

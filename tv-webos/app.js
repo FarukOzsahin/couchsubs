@@ -6,7 +6,7 @@
   'use strict';
 
   // TV uygulamasının sürümü: appinfo.json, tv-tizen/config.xml ve tv-android/app/build.gradle ile aynı tutulur.
-  var APP_VERSION = '0.9.24';
+  var APP_VERSION = '0.9.31';
   var t = window.t;
   var config = window.COUCHSUBS_CONFIG || {};
   var platform = window.COUCHSUBS_PLATFORM;
@@ -111,9 +111,15 @@
       save('hdmi', hdmiPort);
       showHdmi(hdmiPort);
     }
-    if (params.server && params.server !== server) {
-      save('server', params.server);
-      connect(params.server);
+    if (params.server) {
+      // Adresi bilgisayar ya da telefon kendisi verdi: bağlanınca kimliği "kendi CouchSubs'ı" olarak kaydedilir.
+      adoptAddress = params.server;
+      if (params.server !== server) {
+        save('server', params.server);
+        connect(params.server);
+      } else if (eventSource && eventSource.readyState === 1) {
+        learnServer(server);
+      }
     }
   }
 
@@ -131,8 +137,32 @@
     watchPicture(port);
     platform.showHdmi(port, $('video-host'), function (kind) {
       setStatus('st-video', t(statuses[kind][0]), statuses[kind][1]);
+      // Giriş değişince çözünürlük de değişir; görüntü gelince yeniden okunur.
+      if (kind === 'playing') watchResolution();
       notePicture(port, kind);
     });
+  }
+
+  // --- HDMI görüntüsünün çözünürlüğü ---
+  // TV'nin bildirdiği giriş çözünürlüğü ve yenileme hızı panelde gösterilir ("3840×2160 · 60 Hz"): uygulama içinde
+  // PS5 görüntüsünün 1080p'ye düştüğü bildirimlerini doğrulamak için. Yalnız bildiren platformlarda (Samsung) görünür.
+  function formatResolution(info) {
+    if (!info || !(info.width > 0) || !(info.height > 0)) return '';
+    var text = Math.round(info.width) + '×' + Math.round(info.height);
+    var hz = Number(info.frequency);
+    if (hz > 0) text += ' · ' + (Math.abs(hz - Math.round(hz)) < 0.05 ? Math.round(hz) : hz.toFixed(2)) + ' Hz';
+    return text;
+  }
+
+  function showResolution(info) {
+    var text = formatResolution(info);
+    $('row-resolution').style.display = text ? '' : 'none';
+    if (text) setStatus('st-resolution', text, 'muted');
+  }
+
+  function watchResolution() {
+    if (typeof platform.videoResolution !== 'function') return;
+    try { platform.videoResolution(showResolution); } catch (e) {}
   }
 
   // --- HDMI görüntüsü gelmiyor ---
@@ -351,10 +381,41 @@
     return box.right > box.left && box.bottom > box.top ? box : null;
   }
 
+  function fillText(el, text, icons) {
+    /* Çevirinin içindeki kumanda simgeleri ("Koşmak için [△] basılı tut"): bilgisayar simgeyi oyun karesinden kesip
+       PNG olarak gönderir; icons = [{at, src}], at düz metindeki yeridir. Simge yoksa düz metin yazılır. */
+    el.textContent = '';
+    var list = [];
+    for (var i = 0; icons && i < icons.length; i++) {
+      var icon = icons[i];
+      if (icon && typeof icon.at === 'number' && typeof icon.src === 'string' && icon.src.indexOf('data:image/') === 0) {
+        list.push(icon);
+      }
+    }
+    if (!list.length) {
+      el.textContent = text;
+      return;
+    }
+    list.sort(function (a, b) { return a.at - b.at; });
+    var position = 0;
+    for (var j = 0; j < list.length; j++) {
+      var at = Math.max(position, Math.min(text.length, Math.floor(list[j].at)));
+      if (at > position) el.appendChild(document.createTextNode(text.slice(position, at)));
+      var image = document.createElement('img');
+      image.className = 'icon';
+      image.alt = '';
+      image.src = list[j].src;
+      el.appendChild(image);
+      position = at;
+    }
+    if (position < text.length) el.appendChild(document.createTextNode(text.slice(position)));
+  }
+
   // --- Uzun çeviriyi bölme ---
-  // Uzun çeviri ekranda tek uzun satır olarak taşmasın: satır başına en çok 42 karakter, en çok 3 satır, kelime
-  // sınırından ve dengeli bölünür; 3 satıra sığmazsa yazı biraz küçülür (en çok %75'e kadar). Konuşan adı ("ARTHUR:")
-  // sonraki sözcükle birleşik kalır, hep ilk satırdadır. Mac, Windows, Android ve OBS (SubtitleWrap) aynı kuralları uygular.
+  // Uzun çeviri en çok 3 satıra, kelime sınırından ve dengeli bölünür; 3 satıra sığmazsa yazı biraz küçülür (en çok
+  // %75'e kadar). Konuşan adı ("ARTHUR:") sonraki sözcükle birleşik kalır, hep ilk satırdadır. Satır sınırı TV'de
+  // ekran genişliğidir (aşağıda wrapToWidth); 42 karakter kuralı yalnız ölçüm yapılamazsa kullanılır. Mac, Windows,
+  // Android ve OBS (SubtitleWrap) hâlâ 42 karakter kuralını uygular.
   var WRAP_MAX_CHARS = 42;
   var WRAP_MAX_LINES = 3;
   var WRAP_MIN_SCALE = 0.75;
@@ -407,9 +468,88 @@
     return out.join('\n');
   }
 
-  function wrapSubtitle(text) {
+  // TV'de bölme karakter sayısına değil ekrandaki gerçek genişliğe göredir: Türkçe çoğu zaman İngilizceden uzun olduğu
+  // için 42 karakter sınırı, ekranda bol yer varken tek satırlık cümleyi dar ve iki satırlık bir kutuya çeviriyordu.
+  // Yazı altyazı alanına (ekranın %84'ü, iç boşluk düşülerek) tek satır sığıyorsa bölünmez; sığmıyorsa en az satıra
+  // dengeli bölünür; 3 satıra da sığmazsa küçülür. Ölçüm yapılamazsa (canvas yok) eski karakter kuralı geçerlidir.
+  var WRAP_WIDTH = 0.84;
+  var measureContext = null;
+
+  function lineWidths(el, text, size) {
+    try {
+      if (!measureContext) measureContext = document.createElement('canvas').getContext('2d');
+      var style = window.getComputedStyle(el);
+      measureContext.font = style.fontWeight + ' ' + size + 'px ' + style.fontFamily;
+      var widest = 0;
+      text.split('\n').forEach(function (line) { widest = Math.max(widest, measureContext.measureText(line).width); });
+      return widest > 0 ? widest : null;
+    } catch (e) {
+      return null;
+    }
+  }
+
+  // Örtü modunda çeviri İngilizce yazının biçimini alır. Örtü İngilizceyi kapatacak boyda kalmak zorunda; çeviri
+  // ekran genişliğine göre bölününce iki satırlık İngilizcenin üstünde tek uzun satır kalıyor, örtü hem geniş hem
+  // yüksek olup ortasında boşluklu, kalın bir siyah kutu çıkıyordu. Ekrana sığan her satır sayısı (1-3) için örtü ile
+  // çevirinin birleşik kutusunun alanı hesaplanır, en küçüğü seçilir: iki satırlık İngilizcede çeviri de aynı
+  // genişlikte iki satıra bölünür, tek satırlıkta (Türkçe biraz uzun da olsa) tek satır kalır. Bir satır daha ancak
+  // kutuyu en az %20 küçültüyorsa eklenir: sığan çeviri yine gereksiz yere bölünmesin.
+  var COVER_LINE_GAIN = 0.8;
+  function wrapToCover(text, words, el, size, room, cover) {
+    var style = window.getComputedStyle(el);
+    var ratio = parseFloat(style.lineHeight) / parseFloat(style.fontSize) || 1.25;
+    var best = null;
+    for (var lines = 1; lines <= Math.min(WRAP_MAX_LINES, words.length); lines++) {
+      var candidate = lines === 1 ? text : wrapBalance(words, lines);
+      var width = lineWidths(el, candidate, size);
+      if (!width || width > room) continue;
+      // İç boşluk: yanlarda toplam bir yazı boyu, üstte ve altta 0.24em.
+      var area = Math.max(cover.width, width + size) * Math.max(cover.height, size * (ratio * lines + 0.48));
+      if (!best || area < best.area * COVER_LINE_GAIN) best = { text: candidate, area: area };
+    }
+    return best ? { text: best.text, scale: 1 } : null;
+  }
+
+  function coverSize(textId) {
+    if (textId !== 'subtitle-text' || placement !== 'cover' || !currentBox) return null;
+    var width = document.documentElement.clientWidth || window.innerWidth || 1920;
+    var height = document.documentElement.clientHeight || window.innerHeight || 1080;
+    var box = coverBounds(screenBox(currentBox, isOverlay()), isOverlay());
+    return {
+      width: bandShape ? width : (box.right - box.left) * width,
+      height: (box.bottom - box.top) * height
+    };
+  }
+
+  function wrapToWidth(text, el, size, cover) {
+    var viewport = document.documentElement.clientWidth || window.innerWidth || 1920;
+    // Yatay iç boşluk iki yanda 0.5em: toplam bir yazı boyu.
+    var room = viewport * WRAP_WIDTH - size;
+    var width = lineWidths(el, text, size);
+    if (!width || room <= 0) return null;
+    var words = wrapTokens(text);
+    if (cover && words.length >= 2) {
+      var shaped = wrapToCover(text, words, el, size, room, cover);
+      if (shaped) return shaped;
+    }
+    if (width <= room) return { text: text, scale: 1 };
+    if (words.length < 2) return { text: text, scale: 1 };
+    var candidate = text;
+    for (var lines = 2; lines <= WRAP_MAX_LINES; lines++) {
+      candidate = wrapBalance(words, Math.min(lines, words.length));
+      if (lines >= words.length) break;
+      if ((lineWidths(el, candidate, size) || Infinity) <= room) return { text: candidate, scale: 1 };
+    }
+    var widest = lineWidths(el, candidate, size) || room;
+    return { text: candidate, scale: Math.max(WRAP_MIN_SCALE, Math.min(1, room / widest)) };
+  }
+
+  function wrapSubtitle(text, el, size, cover) {
+    if (text.indexOf('\n') >= 0) return { text: text, scale: 1 };
+    var measured = el && size ? wrapToWidth(text, el, size, cover) : null;
+    if (measured) return measured;
     var length = Array.from ? Array.from(text).length : text.length;
-    if (length <= WRAP_MAX_CHARS || text.indexOf('\n') >= 0) return { text: text, scale: 1 };
+    if (length <= WRAP_MAX_CHARS) return { text: text, scale: 1 };
     var words = wrapTokens(text);
     if (words.length < 2) return { text: text, scale: 1 };
     var scale = Math.min(1, Math.max(WRAP_MIN_SCALE, WRAP_MAX_CHARS * WRAP_MAX_LINES / length));
@@ -421,12 +561,36 @@
   // Satırı yazar. Sayfadaki metin bölünmüş hâlidir; karşılaştırmalar için özgün metin elementte kalır.
   function setLineText(textId, text, paragraphs, baseSize) {
     var el = $(textId);
-    var wrapped = paragraphs ? { text: text, scale: 1 } : wrapSubtitle(text);
+    var wrapped = paragraphs ? { text: text, scale: 1 } : wrapSubtitle(text, el, baseSize, coverSize(textId));
     el.rawText = text;
     el.textContent = wrapped.text;
     el.style.whiteSpace = 'pre-line';
-    el.style.fontSize = Math.round(baseSize * wrapped.scale) + 'px';
+    var size = Math.round(baseSize * wrapped.scale);
+    el.style.fontSize = size + 'px';
+    // Altyazı kutusu ekranın alt dörtte birini geçmez ve dengeli bölünmüş satırlar korunur: 3 satıra bölünüp %75'e
+    // küçültülse de genişliğe sığmayan yazıda tarayıcı kendiliğinden yeni satır açıyordu. Yazı, hem yükseklik sınırına
+    // hem bölünmüş satır sayısına sığana dek küçülür. Görev paneli gibi satır satır yazılar bu sınırın dışındadır.
+    // Gizli satır (display: none) ölçülemez, 0 yüksekliğiyle döngüye girmez.
+    if (paragraphs) return;
+    var limit = (document.documentElement.clientHeight || window.innerHeight || 1080) * SUBTITLE_MAX_HEIGHT;
+    var lines = wrapped.text.split('\n').length;
+    while (size > SUBTITLE_MIN_FONT && (el.offsetHeight > limit || extraLines(el, lines))) {
+      size -= 1;
+      el.style.fontSize = size + 'px';
+    }
   }
+
+  // Tarayıcı, bölünmüş satırlardan birini genişliğe sığdıramadığı için kendiliğinden satır açtı mı.
+  function extraLines(el, lines) {
+    var style = window.getComputedStyle(el);
+    var line = parseFloat(style.lineHeight);
+    if (!line) return false;
+    var text = el.clientHeight - (parseFloat(style.paddingTop) || 0) - (parseFloat(style.paddingBottom) || 0);
+    return text > line * lines + line / 2;
+  }
+
+  var SUBTITLE_MAX_HEIGHT = 0.24;
+  var SUBTITLE_MIN_FONT = 16;
 
   function rawText(id) {
     var el = $(id);
@@ -581,12 +745,8 @@
     return bottom;
   }
 
-  function showScreen(items, duration) {
-    var host = $('screen');
-    // "Ekran çevriliyor…" yazısı sonuçların üstünde kalmasın.
-    hideSubtitle('screen');
-    host.innerHTML = '';
-    host.className = '';
+  // Yeriyle gelen çevirileri (ekranı çevir öğeleri, ek alan blokları) kendi İngilizce yazılarının üstüne koyar.
+  function placeItems(host, items) {
     var width = window.innerWidth || 1920;
     var height = window.innerHeight || 1080;
     for (var i = 0; i < (items || []).length; i++) {
@@ -595,7 +755,7 @@
       if (!box || !item.text) continue;
       var el = document.createElement('div');
       el.className = item.paragraphs === true ? 'item paragraphs' : 'item';
-      el.textContent = item.text;
+      fillText(el, item.text, item.icons);
       var left = Math.max(0, box.left - SCREEN_PAD);
       var top = Math.max(0, box.top - SCREEN_PAD);
       var boxHeight = (box.bottom - box.top + 2 * SCREEN_PAD) * height;
@@ -619,6 +779,15 @@
       // En küçük okunabilir boyutta da sığmayan metni kesmeyiz/gizlemeyiz.
       // Bu uç durumda eski doğal büyüme davranışı korunur.
     }
+  }
+
+  function showScreen(items, duration) {
+    var host = $('screen');
+    // "Ekran çevriliyor…" yazısı sonuçların üstünde kalmasın.
+    hideSubtitle('screen');
+    host.innerHTML = '';
+    host.className = '';
+    placeItems(host, items);
     clearTimeout(screenTimer);
     screenTimer = setTimeout(hideScreen, duration || 20000);
   }
@@ -633,7 +802,9 @@
   // Bilgisayar altyazının yanında ekranın köşelerindeki yazıları da (görev, telefon mesajı, bildirim) sürekli okur ve
   // her alanın çevirisini "region" olayıyla gönderir: {id, text, box, line}. Çeviri İngilizce yazının yerinde küçük bir
   // kutuda durur; ekranın sağ yarısındaki kutu sağa, alt yarısındaki alta yaslanır, Türkçe uzun gelirse kutu ekranın
-  // içine doğru büyür. Boş "text" o alanın kutusunu, "region-clear" hepsini kaldırır. Ana altyazıya dokunulmaz.
+  // içine doğru büyür. Alanda birbirinden ayrı duran yazılar varsa "blocks" her grubun çevirisini kendi yeriyle taşır
+  // ve her biri "ekranı çevir"deki gibi kendi yazısının üstüne konur. Boş "text" o alanın kutusunu, "region-clear"
+  // hepsini kaldırır. Ana altyazıya dokunulmaz.
 
   var regionBoxes = {};
   var REGION_PAD = 0.004;
@@ -645,17 +816,30 @@
     if (!id) return;
     var box = validBox(data.box);
     if (!data.text || !box) return hideRegion(id);
+    // Alanda ayrı duran yazı grupları (görev başlığı ve ayrı sütundaki hedef) kendi yerleriyle gelir: her biri "ekranı
+    // çevir"deki gibi kendi İngilizce yazısının üstüne konur. Bloksuz olayda alanın çevirisi tek kutuda kalır.
+    var blocks = Array.isArray(data.blocks) ? data.blocks : null;
+    var kind = blocks && blocks.length ? 'region-blocks' : 'region';
     var el = regionBoxes[id];
+    // Bloklar her olayda baştan dizilir; tek kutudan bloklara (ya da tersine) geçen alanın eski kutusu kalkar.
+    if (el && (el.className !== kind || kind === 'region-blocks')) {
+      hideRegion(id);
+      el = null;
+    }
     if (!el) {
       el = document.createElement('div');
-      el.className = 'region';
+      el.className = kind;
       $('regions').appendChild(el);
       regionBoxes[id] = el;
     }
     $('regions').className = '';
+    if (kind === 'region-blocks') {
+      placeItems(el, blocks);
+      return;
+    }
     var width = window.innerWidth || 1920;
     var height = window.innerHeight || 1080;
-    el.textContent = data.text;
+    fillText(el, data.text, data.icons);
     el.style.left = el.style.right = el.style.top = el.style.bottom = '';
     if ((box.left + box.right) / 2 > 0.5) {
       el.style.right = (Math.max(0, 1 - box.right - REGION_PAD) * 100) + '%';
@@ -705,7 +889,7 @@
   function layout() {
     var el = $('subtitle');
     var cover = $('subtitle-cover');
-    var box = placement === 'fixed' ? null : currentBox;
+    var box = placement === 'fixed' || !currentBox ? null : screenBox(currentBox, isOverlay());
     el.style.left = '8%';
     el.style.right = '8%';
     el.style.top = 'auto';
@@ -749,13 +933,39 @@
   // farklı iki kutu görünüyordu. Örtü çevirinin zeminini tamamen kapladığından ikisi tek bir siyah kutu gibi görünür.
   var COVER_PAD = 0.012;
 
+  // Katman modu (Android TV, #473): HDMI'yı CouchSubs değil TV'nin kendi giriş ekranı çizer ve resmi çoğu TV'de kenar
+  // taşmasıyla (overscan) %5'e kadar büyütür. İngilizce satırın yeri bilgisayarın gördüğü karedeki yeridir; ekranda daha
+  // geniş ve kenara doğru kaymış durur. Örtü kareye göre çizilince İngilizce satırdan dar kalıyor, yazı yanlardan
+  // görünüyordu (arka plan "Tam" olsa da saydam sanılıyordu). Uygulama içinde (TvView) resim büyütülmez; orada değişmez.
+  var OVERLAY_ZOOM = 1.05;
+  var OVERLAY_PAD = 0.01;
+
+  function isOverlay() {
+    return (' ' + ((document.body && document.body.className) || '') + ' ').indexOf(' overlay ') >= 0;
+  }
+
+  // Karedeki kutunun ekrandaki yeri: katmanda ekran ortasına göre büyütülmüş, uygulama içinde aynı.
+  function screenBox(box, overlay) {
+    if (!overlay) return box;
+    function at(value) { return Math.max(0, Math.min(1, 0.5 + (value - 0.5) * OVERLAY_ZOOM)); }
+    return { left: at(box.left), top: at(box.top), right: at(box.right), bottom: at(box.bottom) };
+  }
+
+  // Örtünün kapladığı alan (ekranın oranı olarak): satırın kutusu ve iki yanında pay. Katmanda pay biraz daha geniştir:
+  // TV resmi hiç büyütmese de büyütülmüş kutu ile bu pay İngilizce satırı yine kaplar.
+  function coverBounds(box, overlay) {
+    var pad = COVER_PAD + (overlay ? OVERLAY_PAD : 0);
+    return { left: box.left - pad, top: box.top - pad, right: box.right + pad, bottom: box.bottom + pad };
+  }
+
   function placeCover(cover, box, text) {
     var width = document.documentElement.clientWidth || window.innerWidth || 1920;
     var height = document.documentElement.clientHeight || window.innerHeight || 1080;
-    var left = (box.left - COVER_PAD) * width;
-    var top = (box.top - COVER_PAD) * height;
-    var right = (box.right + COVER_PAD) * width;
-    var bottom = (box.bottom + COVER_PAD) * height;
+    var bounds = coverBounds(box, isOverlay());
+    var left = bounds.left * width;
+    var top = bounds.top * height;
+    var right = bounds.right * width;
+    var bottom = bounds.bottom * height;
     if (text && text.width > 0 && text.height > 0) {
       left = Math.min(left, text.left);
       top = Math.min(top, text.top);
@@ -815,9 +1025,7 @@
   function applyStyle(style) {
     if (style.fontSize) {
       fontBase = style.fontSize;
-      var shown = rawText('subtitle-text');
-      if ($('subtitle-text').rawText !== undefined && shown) setLineText('subtitle-text', shown, !!shownParagraphs, fontBase);
-      else $('subtitle-text').style.fontSize = style.fontSize + 'px';
+      $('subtitle-text').style.fontSize = style.fontSize + 'px';
       $('subtitle-prev-text').style.fontSize = Math.round(style.fontSize * 0.8) + 'px';
       $('subtitle-prev2-text').style.fontSize = Math.round(style.fontSize * 0.8) + 'px';
     }
@@ -826,13 +1034,14 @@
     setBodyClass('band', bandShape);
     if (typeof style.background === 'number') {
       var alpha = Math.max(0, Math.min(100, style.background)) / 100;
-      // Zemin çok saydamsa yazıya sert kontur eklenir (style.css, body.thin-bg).
-      setBodyClass('thin-bg', alpha < 0.3);
-      textBackground = 'rgba(0, 0, 0, ' + alpha + ')';
-      coverBackground = style.background >= 100 ? '#000' : textBackground;
+      // Zemin saydamsa yazıya sert kontur eklenir (style.css, body.thin-bg).
+      setBodyClass('thin-bg', alpha < 0.5);
+      // Saf siyah değil, hafif mavimsi siyah (#0c0e12): oyun görüntüsünün üstünde daha yumuşak durur.
+      textBackground = 'rgba(12, 14, 18, ' + alpha + ')';
+      coverBackground = style.background >= 100 ? '#0c0e12' : textBackground;
       $('subtitle-text').style.background = textBackground;
-      $('subtitle-prev-text').style.background = 'rgba(0, 0, 0, ' + (alpha * 0.83).toFixed(2) + ')';
-      $('subtitle-prev2-text').style.background = 'rgba(0, 0, 0, ' + (alpha * 0.83).toFixed(2) + ')';
+      $('subtitle-prev-text').style.background = 'rgba(12, 14, 18, ' + (alpha * 0.83).toFixed(2) + ')';
+      $('subtitle-prev2-text').style.background = 'rgba(12, 14, 18, ' + (alpha * 0.83).toFixed(2) + ')';
     }
     // Ayarı göndermeyen bilgisayar (eski Windows sürümü, Mac) eski davranışı bekler: önceki satırlar üstte kalır.
     // Yoksa bir kez kapatılan ayar başka bilgisayara bağlanınca da kapalı kalırdı.
@@ -840,15 +1049,18 @@
     save('stackPrevious', stackPrevious ? '1' : '0');
     if (!stackPrevious) hidePrevious();
     if (typeof style.bold === 'boolean') {
-      $('subtitle-text').style.fontWeight = style.bold ? '700' : '600';
-      $('subtitle-prev-text').style.fontWeight = style.bold ? '700' : '600';
-      $('subtitle-prev2-text').style.fontWeight = style.bold ? '700' : '600';
+      $('subtitle-text').style.fontWeight = style.bold ? '700' : '400';
+      $('subtitle-prev-text').style.fontWeight = style.bold ? '700' : '400';
+      $('subtitle-prev2-text').style.fontWeight = style.bold ? '700' : '400';
     }
     if (TEXT_COLORS[style.textColor]) {
       $('subtitle-text').style.color = TEXT_COLORS[style.textColor];
       $('subtitle-prev-text').style.color = TEXT_COLORS[style.textColor];
       $('subtitle-prev2-text').style.color = TEXT_COLORS[style.textColor];
     }
+    // Ekrandaki yazı yeni ayarlarla yeniden bölünür: yazı boyu, kalınlık, yerleşim ve bant bölmeyi değiştirir.
+    var shown = rawText('subtitle-text');
+    if ($('subtitle-text').rawText !== undefined && shown) setLineText('subtitle-text', shown, !!shownParagraphs, fontBase);
     layout();
     if (style.bottomPercent >= 0 && String(style.bottomPercent) !== load('appBottom')) {
       save('appBottom', style.bottomPercent);
@@ -887,6 +1099,11 @@
   }
 
   function connect(address) {
+    // Arka plandayken bağlanılmaz; adres akılda tutulur, uygulama öne gelince bağlanır (bkz. dropWhileHidden).
+    if (pausedByHidden) {
+      server = address;
+      return;
+    }
     if (demoRunning()) stopDemo();
     if (eventSource) eventSource.close();
     if (address !== server) failures = 0;
@@ -907,6 +1124,7 @@
       clearTimeout(dropTimer);
       dropTimer = null;
       setStatus('st-conn', t('connected'), 'ok');
+      learnServer(address);
     };
     eventSource.onerror = function () {
       // Bağlantı kısa süre içinde geri gelmezse eski altyazı ekranda asılı kalmasın. Bir anlık kopma yazıyı silmez.
@@ -1185,6 +1403,12 @@
   var SCAN_PAUSE_MS = 30000;
   var SCAN_SOON_MS = 3000;
   var FAILS_BEFORE_SCAN = 3;
+  // TV kendi adresini söyleyemiyor ve kayıtlı adres de yoksa taranacak yaygın ev ağları (modemlerin varsayılanları,
+  // sırayla). Eskiden bu durumda tarama listesi boş kalıyor, hiçbir adres denenmiyordu: telefondan ya da başlatma
+  // parametresi vermeyen yoldan kurulan TV (eski webOS, adresini vermeyen Samsung) "Ağda CouchSubs aranıyor…" ekranında
+  // kalıyor, telefon "TV uygulaması bekleniyor" diyordu (#469, #484). Bir ağda CouchSubs bulununca sonrakiler taranmaz.
+  var GUESS_SUBNETS = ['192.168.1', '192.168.0', '10.0.0', '192.168.2', '192.168.100', '192.168.31', '192.168.50',
+    '192.168.178', '10.0.1', '192.168.10', '192.168.3', '192.168.8', '192.168.88'];
   var scanTimer = null;
   var scanDue = 0;
   var scanning = false;
@@ -1231,7 +1455,7 @@
     el.textContent = (tvAddress ? t('waitingAddress').replace('%1', tvAddress) + ' · ' : '') + t('waitingSearching');
   }
 
-  // Taranacak ağlar: TV'nin kendi ağı, sonra kayıtlı adresin ağı (aynıysa bir kez).
+  // Taranacak ağlar: TV'nin kendi ağı, sonra kayıtlı adresin ağı (aynıysa bir kez); ikisi de yoksa yaygın ev ağları (guessed).
   function scanSubnets(done) {
     var fromServer = subnetOf(server);
     function finish(ip) {
@@ -1243,7 +1467,8 @@
       var own = subnetOf(ip);
       if (own) list.push(own);
       if (fromServer && fromServer !== own) list.push(fromServer);
-      done(list);
+      if (list.length) return done(list, false);
+      done(GUESS_SUBNETS.slice(), true);
     }
     if (!platform.localAddress) return finish(null);
     var answered = false;
@@ -1261,15 +1486,73 @@
     }
   }
 
+  // --- Kendi CouchSubs'ını tanıma (GitHub #425) ---
+  // Aynı ağda iki bilgisayar/telefon CouchSubs çalıştırınca TV eskiden taramada ilk yanıt verene bağlanıyordu; iki evin
+  // (ya da iki odanın) altyazıları karışıyordu. CouchSubs /hello yanıtında kurulum kimliğini ("id") ve bağlı TV sayısını
+  // ("tvs") verir. TV bağlandığı CouchSubs'ın kimliğini kaydeder; taramada önce onu, yoksa TV'si bağlı olmayanı seçer.
+  var serverId = load('serverId');
+  // Bu adrese bağlanınca kimlik, kayıtlı kimlik olmasa da kaydedilir (adresi bilgisayar başlatma parametresiyle verdi).
+  var adoptAddress = null;
+  // Bağlı olunan CouchSubs kayıtlı kimlik değil (kendisi kapalıyken bulunan): kendi CouchSubs'ı dönünce ona geçilir.
+  var fallback = false;
+  var FALLBACK_SCAN_MS = 60000;
+
+  function helloInfo(text) {
+    try {
+      var info = JSON.parse(text);
+      return info && typeof info === 'object' ? info : {};
+    } catch (e) {
+      return {};
+    }
+  }
+
+  // Taramada bulunanlar ({ address, id, tvs }) arasından bağlanılacak CouchSubs; emin olunamıyorsa null.
+  // 1) Kayıtlı kimlik. 2) TV'si bağlı olmayan tek CouchSubs (başka TV'ye hizmet eden, başka evin/odanın kurulumudur).
+  // 3) Kayıtlı kimlik varsa başkası seçilmez. 4) İlk kez açılan TV: TV'si bağlı olmayan ilk, o da yoksa ilk bulunan.
+  function pickServer(found, savedId) {
+    var i, idle = [];
+    for (i = 0; i < found.length; i++) if (savedId && found[i].id === savedId) return found[i];
+    for (i = 0; i < found.length; i++) if (!(found[i].tvs > 0)) idle.push(found[i]);
+    if (idle.length === 1) return idle[0];
+    if (savedId) return null;
+    return idle[0] || found[0] || null;
+  }
+  window.__pickServer = pickServer;
+
+  // Bağlantı açılınca CouchSubs'ın kimliği sorulur. Kayıtlı kimlik yoksa ya da adres parametreyle geldiyse kaydedilir;
+  // başka bir kimlikse (kendi CouchSubs'ı kapalı, ya da modem adresleri değiştirmiş) kendi CouchSubs'ı aranmaya devam edilir.
+  function learnServer(address) {
+    var adopt = adoptAddress === address;
+    if (adopt) adoptAddress = null;
+    probe(address, function (ok, info) {
+      if (address !== server) return;
+      var id = ok && info.id ? String(info.id) : null;
+      if (!id) {
+        fallback = false;
+        return;
+      }
+      if (adopt || !serverId) {
+        serverId = id;
+        save('serverId', id);
+      }
+      var wasFallback = fallback;
+      fallback = id !== serverId;
+      if (fallback) scheduleScan(wasFallback ? FALLBACK_SCAN_MS : SCAN_SOON_MS);
+    });
+  }
+
   function probe(address, done) {
     var request = new XMLHttpRequest();
     var finished = false;
-    function finish(ok) {
+    function finish(ok, info) {
       if (finished) return;
       finished = true;
-      done(ok);
+      done(ok, info || {});
     }
-    request.onload = function () { finish(request.status === 200 && request.responseText.indexOf('couchsubs') >= 0); };
+    request.onload = function () {
+      var ok = request.status === 200 && request.responseText.indexOf('couchsubs') >= 0;
+      finish(ok, ok ? helloInfo(request.responseText) : null);
+    };
     request.onerror = function () { finish(false); };
     request.ontimeout = function () { finish(false); };
     try {
@@ -1285,34 +1568,55 @@
     if (scanning) return;
     cancelScan();
     scanning = true;
-    scanSubnets(function (subnets) {
+    scanSubnets(function (subnets, guessed) {
       var addresses = [];
       for (var s = 0; s < subnets.length; s++) {
         for (var host = 1; host <= 254; host++) addresses.push('http://' + subnets[s] + '.' + host + ':' + SERVER_PORT);
       }
-      var next = 0, active = 0, found = false;
+      var next = 0, active = 0, done = false, found = [];
+      // Tahmin edilen ağlar birer birer taranır: CouchSubs bulunan ağda durulur (bilinen ağlar hep birlikte).
+      var stop = guessed ? Math.min(254, addresses.length) : addresses.length;
       function pump() {
-        while (!found && active < SCAN_PARALLEL && next < addresses.length) {
+        // Tahminli tarama uzun sürer; bu arada CouchSubs adresini kendisi verip bağlantı açıldıysa tarama bırakılır.
+        if (guessed && !done && !fallback && eventSource && eventSource.readyState === 1) {
+          done = true;
+          scanning = false;
+          return;
+        }
+        while (!done && active < SCAN_PARALLEL && next < stop) {
           active++;
           tryAddress(addresses[next++]);
         }
-        if (!found && !active && next >= addresses.length) {
-          scanning = false;
-          scheduleScan();
-        }
+        if (done || active || next < stop) return;
+        if (found.length || stop >= addresses.length) return finish(pickServer(found, serverId));
+        stop = Math.min(stop + 254, addresses.length);
+        pump();
       }
+      // Kayıtlı kimlik bulununca tarama hemen biter; yoksa bütün ağ taranıp aralarından seçilir (eskiden ilk bulunan).
       function tryAddress(address) {
-        probe(address, function (ok) {
+        probe(address, function (ok, info) {
           active--;
-          if (found) return;
-          if (!ok) return pump();
-          found = true;
-          scanning = false;
-          // Bulunan adres kaydedilir: TV bir sonraki açılışta eski adrese takılmasın.
-          save('server', address);
-          // Aynı bilgisayarsa EventSource kendisi yeniden bağlanır; kapanıp vazgeçtiyse (CLOSED) yeniden kurulur.
-          if (address !== server || (eventSource && eventSource.readyState === 2)) connect(address);
+          if (done) return;
+          if (ok) {
+            var entry = { address: address, id: info.id ? String(info.id) : null, tvs: typeof info.tvs === 'number' ? info.tvs : null };
+            found.push(entry);
+            if (serverId && entry.id === serverId) return finish(entry);
+          }
+          pump();
         });
+      }
+      function finish(choice) {
+        done = true;
+        scanning = false;
+        if (!choice) {
+          scheduleScan(fallback ? FALLBACK_SCAN_MS : SCAN_PAUSE_MS);
+          return;
+        }
+        // Bulunan adres kaydedilir: TV bir sonraki açılışta eski adrese takılmasın.
+        save('server', choice.address);
+        // Aynı bilgisayarsa EventSource kendisi yeniden bağlanır; kapanıp vazgeçtiyse (CLOSED) yeniden kurulur.
+        if (choice.address !== server || (eventSource && eventSource.readyState === 2)) connect(choice.address);
+        else if (fallback) scheduleScan(FALLBACK_SCAN_MS);
       }
       pump();
     });
@@ -1420,8 +1724,42 @@
     $('source-tip').className = 'hidden';
   }
 
+  // --- Arka plandayken bağlantıyı bırakma (Samsung) ---
+  // Samsung uygulamayı arka plana atınca (Anynet+, Otomatik Kaynak Değiştirme, Home tuşu) sayfa duraklar ama bağlantı
+  // açık kalır. Bilgisayar TV uygulamasının bağlı olduğunu sanıp onu yeniden açmıyordu; altyazı ekrana gelmiyordu.
+  // Bağlantı bırakılınca bilgisayar uygulamayı birkaç saniye içinde yeniden öne getirir (TvKeeper). Yalnız bu davranışı
+  // isteyen platformda (platform.closeWhenHidden) çalışır.
+  var pausedByHidden = false;
+
+  function dropWhileHidden() {
+    if (!platform.closeWhenHidden || leaving || pausedByHidden || !eventSource) return;
+    pausedByHidden = true;
+    eventSource.close();
+    eventSource = null;
+    clearTimeout(dropTimer);
+    dropTimer = null;
+    cancelScan();
+    // Öne gelince eski altyazı ekranda asılı kalmasın.
+    hideSubtitle('hidden');
+    hideScreen();
+    hideRegions();
+    setStatus('st-conn', t('reconnecting'), 'bad');
+  }
+
+  function resumeAfterHidden() {
+    if (!pausedByHidden) return;
+    pausedByHidden = false;
+    if (server) connect(server);
+  }
+
   document.addEventListener('visibilitychange', function () {
-    if (document.hidden) noteHidden(); else noteVisible();
+    if (document.hidden) {
+      noteHidden();
+      dropWhileHidden();
+    } else {
+      resumeAfterHidden();
+      noteVisible();
+    }
   });
 
   // --- Panel ve kumanda ---
@@ -1445,10 +1783,17 @@
 
   // Panel açıkken bekleme kutusu kapanır: ikisi üst üste binince yazılar okunmuyor.
   function showPanel(autoHide) {
+    hidePanelTip();
     $('waiting').className = 'hidden';
     $('panel').className = '';
     clearTimeout(panelTimer);
-    if (autoHide) panelTimer = setTimeout(hidePanel, 8000);
+    if (autoHide) panelTimer = setTimeout(autoHidePanel, 8000);
+  }
+
+  // Panel kendiliğinden kapandı: ilk açılışlarda panele nasıl dönüleceği söylenir.
+  function autoHidePanel() {
+    hidePanel();
+    maybeShowPanelTip();
   }
 
   function hidePanel() {
@@ -1458,6 +1803,35 @@
 
   function togglePanel() {
     if ($('panel').className === 'hidden') showPanel(false); else hidePanel();
+  }
+
+  // --- Panel ipucu ---
+  // Bağlanınca panel 8 sn görünüp kapanır; ekranda yalnız konsolun HDMI görüntüsü kalır. Kullanıcı uygulamanın onu
+  // "PlayStation ekranına attığını", uygulamaya ve ayarlara giremediğini sanıyordu. İlk PANEL_TIP_LAUNCHES açılışta panel
+  // kendiliğinden kapanınca altta kısa bir ipucu çıkar: Tamam paneli açar, altyazı ayarları telefonda ya da
+  // bilgisayardadır. Herhangi bir tuş ipucunu kapatır; Geri yalnız ipucunu kapatır, uygulamadan çıkmaz.
+  var PANEL_TIP_LAUNCHES = 3;
+  var PANEL_TIP_MS = 15000;
+  var panelTipTimer = null;
+  var panelTipDone = false; // Bu açılışta ipucu gösterildi ya da gösterilmeyecek.
+
+  function maybeShowPanelTip() {
+    if (panelTipDone || !server || demoRunning() || sourceTipShown() || noPictureShown()) return;
+    if ($('panel').className !== 'hidden') return;
+    panelTipDone = true;
+    var shown = Number(load('panelTips')) || 0;
+    if (shown >= PANEL_TIP_LAUNCHES) return;
+    save('panelTips', shown + 1);
+    $('panel-tip').className = '';
+    clearTimeout(panelTipTimer);
+    panelTipTimer = setTimeout(hidePanelTip, PANEL_TIP_MS);
+  }
+
+  function panelTipShown() { return $('panel-tip').className !== 'hidden'; }
+
+  function hidePanelTip() {
+    clearTimeout(panelTipTimer);
+    $('panel-tip').className = 'hidden';
   }
 
   // Sayı tuşu olmayan kumandalar için: panel açıkken sol ve sağ HDMI girişini değiştirir.
@@ -1472,6 +1846,7 @@
   var lastOkKey = 0;
   document.addEventListener('click', function () {
     if (Date.now() - lastOkKey < 400) return;
+    hidePanelTip();
     if (sourceTipShown()) hideSourceTip();
     else if (noPictureShown()) return;
     else if ($('waiting').className !== 'hidden') startDemo();
@@ -1480,6 +1855,11 @@
 
   document.addEventListener('keydown', function (e) {
     var code = e.keyCode;
+    if (panelTipShown()) {
+      hidePanelTip();
+      // Geri yalnız ipucunu kapatır; Tamam ve diğer tuşlar her zamanki işini de yapar (Tamam paneli açar).
+      if (code === KEY.BACK) { e.preventDefault(); return; }
+    }
     if (code === KEY.OK) lastOkKey = Date.now();
     if (code === KEY.OK && sourceTipShown()) {
       hideSourceTip();

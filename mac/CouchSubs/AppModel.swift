@@ -79,8 +79,8 @@ protocol AppServices: AnyObject {
     func isAndroidDebugOn(host: String) async -> Bool
     /// Ağda ADB'si açık cihazlar.
     func scanAndroidTVs() async -> [String]
-    /// Eksikse ya da eskiyse kurar; TV'deki sürümü döner.
-    func installAndroidApp(host: String, app: BundledTVApp, onEvent: @escaping @Sendable (TVInstallEvent) -> Void) async throws -> String
+    /// Eksikse ya da eskiyse kurar; TV'deki sürümü döner. `open`: uygulama güncelse de TV'de açılır ("yeniden kur").
+    func installAndroidApp(host: String, app: BundledTVApp, open: Bool, onEvent: @escaping @Sendable (TVInstallEvent) -> Void) async throws -> String
 }
 
 struct BundledTVApp: Equatable {
@@ -93,6 +93,29 @@ struct BundledTVApp: Equatable {
         guard let underscore = stem.lastIndex(of: "_"), underscore < stem.index(before: stem.endIndex) else { return nil }
         return String(stem[stem.index(after: underscore)...])
     }
+}
+
+/// Bekçinin Samsung'da TV uygulamasını açma yolu: önce geliştirici bağlantısı (sdb), olmazsa uzaktan kumanda bağlantısı
+/// (8002, ilk bağlantıda TV izin sorar). Samsung önplandaki uygulamayı söylemez; bekçi yalnız açar.
+final class SamsungLauncher: TVControlling, @unchecked Sendable {
+    private let openWithSdb: () async -> Bool
+    private let connectRemote: () async throws -> TVControlling
+
+    init(openWithSdb: @escaping () async -> Bool, connectRemote: @escaping () async throws -> TVControlling) {
+        self.openWithSdb = openWithSdb
+        self.connectRemote = connectRemote
+    }
+
+    func launch(appId: String, params: [String: Any]) async throws {
+        if await openWithSdb() { return }
+        let remote = try await connectRemote()
+        defer { remote.close() }
+        try await remote.launch(appId: appId, params: params)
+    }
+
+    func foregroundAppId() async throws -> String { "" }
+
+    func close() {}
 }
 
 /// Denetlenemeyen TV'ler için: TV uygulaması kendisi bağlanır.
@@ -177,7 +200,18 @@ final class LiveServices: AppServices {
         case .samsung:
             let client = SamsungClient(tv: tv, token: key)
             defer { client.close() }
-            let token = try await client.connect()
+            let token: String
+            do {
+                token = try await client.connect()
+            } catch {
+                // TV uzaktan kumanda iznini sormadı ya da izin 60 saniyede gelmedi (The Frame'de Sanat Modu, izin kutusu
+                // kapalı TV'ler) ama ağda yanıt veriyor: eşleşme durmaz, TV uygulaması geliştirici bağlantısıyla kurulup
+                // açılır. Önceden "Bağlan" bir dakika bekleyip başa dönüyordu. Açıkça reddedildiyse hata gösterilir.
+                if (error as? SamsungClient.SamsungError) == .rejected { throw error }
+                guard await SamsungDiscovery.developerInfo(host: tv.host) != nil else { throw error }
+                TVInstallLog.write("Samsung uzaktan kumanda izni alınamadı (\(error)); TV 8001'de yanıt verdi, eşleşme izinsiz sürdü.")
+                return TVPairing(key: key ?? "", launched: true)
+            }
             try? await client.launch(appId: AppIdentity.samsungAppId, params: ["server": server])
             return TVPairing(key: token, launched: true)
         case .lg:
@@ -212,8 +246,12 @@ final class LiveServices: AppServices {
                 }
                 return client
             }, search: { await SamsungDiscovery.search() }, onMoved: onMoved)
-            return TVKeeper(connect: { try await locator.connect() }, appId: AppIdentity.samsungAppId, params: params,
-                            appConnected: appConnected)
+            // Önce geliştirici bağlantısı (sdb) denenir: uzaktan kumanda bağlantısıyla açma Tizen 9.0'da (2025 Neo QLED,
+            // OLED) sessizce çalışmıyor, arka plana düşen TV uygulaması geri gelmiyordu (Windows'ta #412).
+            let host = tv.host
+            return TVKeeper(connect: { SamsungLauncher(openWithSdb: { await Self.openSamsungApp(host: host) },
+                                                       connectRemote: { try await locator.connect() }) },
+                            appId: AppIdentity.samsungAppId, params: params, appConnected: appConnected)
         case .lg:
             break
         }
@@ -290,15 +328,26 @@ final class LiveServices: AppServices {
         return (version, result.installed)
     }
 
+    /// Kurulu TV uygulamasını geliştirici bağlantısıyla (sdb, `was_execute`) açar. Geliştirici modu kapalıysa, Host PC IP
+    /// başka bilgisayarınsa ya da TV açmadıysa false döner.
+    static func openSamsungApp(host: String) async -> Bool {
+        guard !host.isEmpty, await isPortOpen(host: host, port: 26101) else { return false }
+        let result = try? await TVHelper.run(["samsung-open", "--host", host,
+                                              "--profiles", TVHelper.dataDirectory.appendingPathComponent("samsung").path,
+                                              "--log", TVInstallLog.file.path])
+        return result?.installed == true
+    }
+
     func isAndroidDebugOn(host: String) async -> Bool { await Self.isPortOpen(host: host, port: 5555) }
 
     func scanAndroidTVs() async -> [String] {
         (try? await TVHelper.run(["android-scan"]).hosts) ?? []
     }
 
-    func installAndroidApp(host: String, app: BundledTVApp, onEvent: @escaping @Sendable (TVInstallEvent) -> Void) async throws -> String {
+    func installAndroidApp(host: String, app: BundledTVApp, open: Bool, onEvent: @escaping @Sendable (TVInstallEvent) -> Void) async throws -> String {
         let result = try await TVHelper.run(["android-install", "--host", host, "--package", app.url.path, "--version", app.version,
-                                             "--key-dir", TVHelper.dataDirectory.appendingPathComponent("adb").path], onEvent: onEvent)
+                                             "--key-dir", TVHelper.dataDirectory.appendingPathComponent("adb").path] + (open ? ["--open"] : []),
+                                            onEvent: onEvent)
         return result.version ?? app.version
     }
 
@@ -414,8 +463,12 @@ enum TVAppState: Equatable {
     case signIn(URL)
     /// Android TV: TV ekranında hata ayıklama izni bekleniyor.
     case approveOnTV
+    /// Android TV: TV'de Google Play sayfası açıldı; kullanıcı TV'de Yükle'ye basmalı.
+    case pressInstallOnTV
     /// Samsung: TV'deki Host PC IP (`tvIp`) bu Mac'in adresi (`computer`) değil; sdb denenmedi (#343).
     case hostPcMismatch(tvIp: String, computer: String)
+    /// Android TV: ağda hata ayıklaması açık birden çok TV var; kurulumun gideceği TV kullanıcıya sorulur (#425).
+    case chooseAndroidTV([String])
 }
 
 extension AppAppearance {
@@ -459,6 +512,11 @@ final class AppModel: ObservableObject {
     @Published private var tvAppMissing = false
     /// TV uygulaması denetimi sürüyor (bekleme ekranı ve çeviri başlangıcı aynı anda çağırabilir).
     @Published private var refreshingTVApp = false
+    /// "TV uygulamasını yeniden kur"a basıldı: Android TV'de uygulama kuruluysa da TV'de açılır.
+    private var openTVAppAfterCheck = false
+    /// Birden çok Android TV bulununca kullanıcının seçtiği TV'nin adresi; yalnız bir sonraki denetimde kullanılır.
+    /// Kurulum başarılı olursa TV'nin adresi zaten kaydedilir; olmazsa bir sonraki denemede yeniden sorulur (#425).
+    private var androidTVChoice: String?
     /// Samsung kurulumu ya da sürüm denetimi sürüyor: olaylar (giriş, kurulum adımı) kartı değiştirebilir.
     @Published private var samsungCheckRunning = false
     @Published var settings: UserSettings {
@@ -484,13 +542,15 @@ final class AppModel: ObservableObject {
             }
             let translationChanged = settings.onlineTranslation != oldValue.onlineTranslation
                 || settings.onlineEngine != oldValue.onlineEngine || settings.geminiModel != oldValue.geminiModel
+                || settings.geminiPaidTier != oldValue.geminiPaidTier
                 || settings.openAIModel != oldValue.openAIModel || settings.claudeModel != oldValue.claudeModel
                 || settings.localAIBaseURL != oldValue.localAIBaseURL || settings.localAIModel != oldValue.localAIModel
                 || settings.aiInstruction != oldValue.aiInstruction
             if translationChanged { Task { await refreshTranslatorStatus() } }
             let languageChanged = settings.sourceLanguage != oldValue.sourceLanguage
                 || settings.targetLanguage != oldValue.targetLanguage
-            if isRunning, languageChanged || translationChanged || settings.fastSubtitleDetection != oldValue.fastSubtitleDetection {
+            if isRunning, languageChanged || translationChanged || settings.fastSubtitleDetection != oldValue.fastSubtitleDetection
+                || settings.watchSubtitleBackground != oldValue.watchSubtitleBackground {
                 if languageChanged { Task { await refreshTranslatorStatus() } }
                 makePipeline()
             }
@@ -525,6 +585,9 @@ final class AppModel: ObservableObject {
     /// Yazı tanıma art arda hata veriyor; değeri diskteki boş yer (GB). macOS, diskte yer kalmayınca okuma modelini
     /// diske yazamaz ve her okumayı hata ile bitirir; altyazı sessizce hiç gelmez.
     @Published var readingFailedFreeGB: Double?
+    /// Yazı tanıma (Vision) art arda takıldı ve takılan okumalar bitmiyor (#507); altyazı gelmez, uygulamayı kapatıp
+    /// açmak gerekir. Çeviriyi durdurup başlatmak artık çalışır, ama Vision'ın kendi kilidi ancak süreç kapanınca çözülür.
+    @Published var readingStuck = false
     private var readFailures = 0
     /// Son PS5 karesi (Ayarlar'daki bölge önizlemesi). Her karede değiştiği için modelin kendi yayınına girmez; yalnız
     /// önizlemeyi gösteren görünüm `framePreview`'u izler, öbür ekranlar her karede yeniden çizilmez.
@@ -1111,20 +1174,34 @@ final class AppModel: ObservableObject {
         var host = tv.host
         let reachable = host.isEmpty ? false : await services.isAndroidDebugOn(host: host)
         if !reachable {
-            // Uygulama kuruluysa ve TV'de hata ayıklama kapalıysa yapılacak bir şey yok.
-            if !needsInstall(bundled) {
+            // Bu Mac'in kurduğu sürüm kayıtlıysa ve TV'de hata ayıklama kapalıysa yapılacak bir şey yok. Ama kayda ancak
+            // TV'nin adresi biliniyorsa ya da TV uygulaması şu an bağlıysa güvenilir: TV sihirbazda yeniden seçilince adres
+            // boşalıyor, kayıt kalıyordu; TV'den kaldırılan uygulama "hazır" görünüyor, kurulum denenmiyordu (#352, #389).
+            if !needsInstall(bundled), !tv.host.isEmpty || tvClients > 0 {
                 tvApp = .upToDate(installedAppVersion ?? bundled.version)
                 return
             }
-            guard let found = await services.scanAndroidTVs().first else {
+            // Birden çok TV varsa ilk bulunana gidilmez: kayıtlı ya da seçilen TV, yoksa kullanıcıya sorulur. Eskiden izin
+            // sorusu başka odadaki TV'de çıkıyor, kurulum "onaylanmadı" diye bitiyordu (#425).
+            let choice = androidTVChoice
+            androidTVChoice = nil
+            switch AndroidTVPick.pick(found: await services.scanAndroidTVs(), preferred: [choice, tv.host].compactMap { $0 }) {
+            case .none:
                 tvApp = .devModeOff
                 return
+            case .ask(let hosts):
+                TVInstallLog.write("Ağda hata ayıklaması açık birden çok Android TV var (\(hosts.joined(separator: ", "))); TV soruluyor.")
+                tvApp = .chooseAndroidTV(hosts)
+                return
+            case .host(let found):
+                host = found
             }
-            host = found
         }
         tvApp = .working
+        let open = openTVAppAfterCheck
+        openTVAppAfterCheck = false
         do {
-            let version = try await services.installAndroidApp(host: host, app: bundled) { [weak self] event in
+            let version = try await services.installAndroidApp(host: host, app: bundled, open: open) { [weak self] event in
                 Task { @MainActor in self?.installEvent(event) }
             }
             // TV'nin adresi bundan sonra sürüm denetimi için kullanılır.
@@ -1141,10 +1218,14 @@ final class AppModel: ObservableObject {
     private func installEvent(_ event: TVInstallEvent) {
         // Kurulum bittikten sonra gelen geç olay sonucu ezmesin.
         switch tvApp {
-        case .working, .signIn, .approveOnTV: break
+        case .working, .signIn, .approveOnTV, .pressInstallOnTV: break
         default: if !samsungCheckRunning { return }
         }
         switch event {
+        // Android TV'de Google Play sayfası açıldı: kart TV'de Yükle'ye basılmasını söyler. Önceden yalnız "kuruluyor"
+        // görünüyordu; TV'deki sayfayı görmeyen kullanıcı dört dakika boyunca bir şey olmuyor sanıyordu.
+        case .progress("play"):
+            tvApp = .pressInstallOnTV
         case .signIn(let url):
             tvApp = .signIn(url)
             openInBrowser(url)
@@ -1158,6 +1239,30 @@ final class AppModel: ObservableObject {
                 tvApp = .working
             }
         }
+    }
+
+    /// Birden çok Android TV arasından seçilen TV'ye kurulur (#425).
+    func chooseAndroidTV(_ host: String) async {
+        androidTVChoice = host
+        tvApp = .working
+        await refreshTVApp()
+    }
+
+    /// Samsung ve Android TV'de TV uygulaması bağlı değilken "TV uygulamasını yeniden kur" görünür (ana ekran ve TV kartı).
+    /// TV'den kaldırılan uygulama bu Mac'in kaydında "kurulu" kalıyordu (#352, #389).
+    var canReinstallTVApp: Bool {
+        guard let tv, tv.brand == .samsung || tv.brand == .androidTV else { return false }
+        return canInstallTVApp && tvClients == 0
+    }
+
+    /// Kurulan sürüm kaydını unutur ve TV'ye yeniden bakar: uygulama TV'de yoksa kurulur, Android TV'de varsa açılır.
+    /// TV'ye ulaşılamazsa kart geliştirici modu / hata ayıklama adımlarını gösterir.
+    func reinstallTVApp() async {
+        guard tv != nil else { return }
+        store.remove(StoreKey.tvAppVersion)
+        openTVAppAfterCheck = true
+        tvApp = .unknown
+        await refreshTVApp()
     }
 
     /// Seçili TV'ye uygulamayı CouchSubs kurabilir mi (paket uygulamayla geldi mi)?
@@ -1180,6 +1285,13 @@ final class AppModel: ObservableObject {
     /// Samsung'da geliştirici modunda "Host PC IP" olarak yazılacak bu Mac'in adresi.
     var computerAddress: String? {
         Self.localAddress(near: tv?.host.isEmpty == false ? tv!.host : nil)
+    }
+
+    /// Host PC IP için gösterilenin dışındaki ev ağı adresleri (Wi-Fi ve Ethernet ikisi de bağlıysa ya da birden çok ağ
+    /// varsa). TV gösterilen adresi kabul etmezse bunlar denenir.
+    var otherComputerAddresses: [String] {
+        let chosen = computerAddress
+        return NetworkAddress.homeAddresses().filter { $0 != chosen }
     }
 
     /// Key Server'dan anahtarı alır (TV ekranındaki parolayla) ve uygulamayı kurar.
@@ -1245,7 +1357,44 @@ final class AppModel: ObservableObject {
     /// Ana ekrandaki "TV'de test et": sunucu henüz açık değilse açılır, deneme altyazısı gönderilir.
     func testSubtitle() async {
         try? await startServer()
+        // TV uygulaması bağlı değilse deneme altyazısı kimseye gitmiyordu: bekçi yalnız çeviri sürerken çalışır, TV
+        // uygulaması kapalıysa ya da bilgisayarı arıyorsa "TV'de test et"e TV'de hiçbir şey çıkmıyordu (Samsung 65S95F).
+        // Önce TV uygulaması açılır (Samsung'da geliştirici bağlantısıyla) ve bağlanması beklenir.
+        if settings.output.showsOnTV, hasTV, let tv, tv.brand != .androidTV, server.connectedClients == 0 {
+            await openTVAppForTest(tv)
+        }
         sendTestSubtitle()
+    }
+
+    /// "TV'de test et"te TV uygulamasının açılıp bağlanması için en çok bu kadar beklenir.
+    var testTVWait: Duration = .seconds(20)
+    /// Deneme altyazısından önce TV uygulaması açılıp bağlanması bekleniyor (düğme bunu gösterir).
+    @Published private(set) var openingTVAppForTest = false
+
+    /// TV uygulamasını açar ve bağlanmasını bekler. Çeviri sürüyorsa bekçi hemen yeniden dener; sürmüyorsa geçici bir
+    /// bekçi kurulur, bekleme bitince kapanır.
+    private func openTVAppForTest(_ tv: LGTV) async {
+        var temporary: KeeperControlling?
+        if let keeper {
+            keeper.reconnect()
+        } else {
+            let server = self.server
+            let made = services.makeKeeper(tv: tv, key: store.load(String.self, for: StoreKey.tvKey), params: ["server": serverAddress(for: tv)],
+                                           appConnected: { server.connectedClients > 0 }, onMoved: { [weak self] moved in
+                Task { @MainActor in self?.tvMoved(to: moved) }
+            }, onKey: { [weak self] key in
+                Task { @MainActor in self?.store.save(key, for: StoreKey.tvKey) }
+            })
+            made.start(interval: .seconds(5))
+            temporary = made
+        }
+        openingTVAppForTest = true
+        let deadline = ContinuousClock.now + testTVWait
+        while server.connectedClients == 0, ContinuousClock.now < deadline {
+            try? await Task.sleep(for: .milliseconds(250))
+        }
+        temporary?.stop()
+        openingTVAppForTest = false
     }
 
     func sendTestSubtitle() {
@@ -1457,9 +1606,10 @@ final class AppModel: ObservableObject {
         let server = self.server
         screenTask = Task { [weak self] in
             do {
-                let reading = try await Task.detached(priority: .userInitiated) { try reader.readLines(frame, deep: false) }.value
-                // Yapay zekâda ekranın bütün yazıları tek istekte gider (bkz. AITranslationCore.translateAll).
-                let items = try await ScreenTranslation.translate(reading, using: translator) { shown in
+                let reading = try await ReadQueue.shared.run { try reader.readLines(frame, deep: false) }
+                // Yapay zekâda ekranın bütün yazıları tek istekte gider (bkz. AITranslationCore.translateAll). Yazının
+                // içindeki kumanda simgeleri okunan kareden kesilip TV'de çevirinin içine konur (ButtonIcons).
+                let items = try await ScreenTranslation.translate(reading, using: translator, frame: frame) { shown in
                     guard !Task.isCancelled else { return }
                     let milliseconds = ScreenTranslation.displayMilliseconds(shown)
                     server.sendScreen(shown, durationMs: milliseconds)
@@ -1526,6 +1676,7 @@ final class AppModel: ObservableObject {
                                         server: server, scheduler: scheduler)
         pipeline.showSpeakerNames = settings.showSpeakerNames
         pipeline.skipsTurkish = settings.targetLanguage == "tr"
+        pipeline.watchSubtitleBackground = settings.watchSubtitleBackground
         pipeline.onPair = { [weak self, weak pipeline] source, translation in
             self?.lastSource = source
             self?.lastTranslation = translation
@@ -1541,6 +1692,9 @@ final class AppModel: ObservableObject {
         pipeline.onReadResult = { [weak self] error in self?.noteRead(error) }
         pipeline.onSpeech = { [weak self] lines in self?.speak(lines) }
         pipeline.onLog = { SubtitleLog.write($0) }
+        ReadQueue.shared.onRebuild = { stuck in
+            SubtitleLog.write("okuma takıldı; okuyucu yeniden kuruldu (bitmeyen okuma: \(stuck))")
+        }
         onlineIssue = nil
         pipeline.warmUp()
         self.pipeline = pipeline
@@ -1599,7 +1753,8 @@ final class AppModel: ObservableObject {
             let model = provider.model(settings.model(for: provider)).id
             online = AITranslator(provider: provider, key: key, model: model, fallback: local,
                                   cache: Self.translationCache(engine: provider.engineID(model: model), source: source, target: target),
-                                  game: game, instruction: settings.aiInstruction)
+                                  game: game, instruction: settings.aiInstruction,
+                                  paidTier: provider == .gemini && settings.geminiPaidTier)
         } else if let key = store.load(String.self, for: storeKey) {
             online = DeepLTranslator(key: key, fallback: local,
                                      cache: Self.translationCache(engine: DeepLTranslator.engineID, source: source, target: target))
@@ -1800,6 +1955,11 @@ final class AppModel: ObservableObject {
     }
 
     private func noteRead(_ error: Error?) {
+        if case ReadQueueError.stuck? = error {
+            if !readingStuck { readingStuck = true }
+            return
+        }
+        if readingStuck { readingStuck = false }
         guard error != nil else {
             readFailures = 0
             // Her başarılı okumada yazılmasın: yayınlanan özellik her atamada bütün ekranları yeniden çizdirir.
@@ -1890,7 +2050,13 @@ final class AppModel: ObservableObject {
         // Eskiden ağ hatası, bulunamayan PS5 ve diğer nedenler hep yalnız "Yeniden bağlanılıyor…" idi.
         case .notFound(let host):
             return String(format: String(localized: "PS5 not found at %@. Make sure it is on and on the same network. Reconnecting…"), host)
-        case .network: return String(localized: "Can't reach the PS5. Reconnecting…")
+        // Kablosuz ağda akış sık kopuyordu (GitHub #388, #401): yeniden bağlanılır, kalıcı çözüm kablodur.
+        case .network:
+            return String(localized: "Lost the connection to the PS5. Reconnecting… If this keeps happening, connect the PS5 to the router with a cable.")
+        // 0x80108b12: PS5'te Uzaktan Oynatma kapalı (GitHub #9). Ayar açılınca yeniden denemede bağlanılır.
+        case .rejected(.some(DisconnectReason.remotePlayDisabled)):
+            return String(format: String(localized: "Remote Play is turned off on the PS5 (code %@). On the PS5, go to Settings › System › Remote Play and turn on Enable Remote Play."),
+                          String(format: "0x%08x", DisconnectReason.remotePlayDisabled))
         // Eskiden "Yeniden bağlanılıyor… (Unknown Session Request Error)" görünüyordu (GitHub #33, #202).
         case .rejected(let code?):
             return String(format: String(localized: "The PS5 rejected the connection (code %@). Another Remote Play app (PS Remote Play) may be open, or the PS5 may be in another session. Close PS Remote Play, restart the PS5, then try again."), String(format: "0x%08x", code))

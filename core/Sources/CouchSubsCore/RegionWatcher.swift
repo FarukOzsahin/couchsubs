@@ -7,7 +7,25 @@ import Foundation
 public protocol RegionSending: AnyObject {
     /// `text` boşsa alanın kutusu kalkar.
     func sendRegion(id: String, text: String, box: TextBox?, lineHeight: Double?)
+    /// Çevirinin içinde kumanda simgeleri varsa (`ButtonIcons`); simgeyi bilmeyen gönderici düz metni yollar.
+    func sendRegion(id: String, text: String, box: TextBox?, lineHeight: Double?, icons: [IconPlacement]?)
+    /// Alanda birbirinden ayrı duran yazı grupları varsa (görev başlığı ve ayrı sütundaki hedef) `blocks` her grubun
+    /// çevirisini kendi yeriyle taşır; TV her birini kendi İngilizce yazısının üstüne koyar. Blokları bilmeyen gönderici
+    /// birleşik metni yollar.
+    func sendRegion(id: String, text: String, box: TextBox?, lineHeight: Double?, icons: [IconPlacement]?,
+                    blocks: [ScreenTranslation.Item]?)
     func clearRegions()
+}
+
+extension RegionSending {
+    public func sendRegion(id: String, text: String, box: TextBox?, lineHeight: Double?, icons: [IconPlacement]?) {
+        sendRegion(id: id, text: text, box: box, lineHeight: lineHeight)
+    }
+
+    public func sendRegion(id: String, text: String, box: TextBox?, lineHeight: Double?, icons: [IconPlacement]?,
+                           blocks: [ScreenTranslation.Item]?) {
+        sendRegion(id: id, text: text, box: box, lineHeight: lineHeight, icons: icons)
+    }
 }
 
 extension SubtitleServer: RegionSending {}
@@ -39,8 +57,21 @@ public final class RegionWatcher {
         /// Son gönderilen çeviri, aynı yazı yeni bir konuma taşındığında yeniden kullanılır.
         var renderedKey: String?
         var renderedText: String?
+        var renderedIcons: [IconPlacement]?
         var renderedBox: TextBox?
         var renderedLineHeight: Double?
+        var renderedLayout: [Block]?
+        /// Gönderilen bloklar ve her birinin `Candidate.blocks` içindeki sırası.
+        var renderedBlocks: [(group: Int, item: ScreenTranslation.Item)]?
+    }
+
+    /// Alanda ayrı duran bir yazı grubu: `Candidate.paragraphs` içinde `start`'tan başlayan `count` parça, karedeki yeri
+    /// ve satır yüksekliği (kareye oranla).
+    struct Block: Equatable {
+        var start: Int
+        var count: Int
+        var box: TextBox
+        var lineHeight: Double
     }
 
     struct Candidate {
@@ -48,6 +79,10 @@ public final class RegionWatcher {
         var box: TextBox?
         var lineHeight: Double?
         var key: String
+        /// Her parçadaki kumanda simgeleri (kareden kesilmiş), parçadaki sırasıyla; simge yoksa nil.
+        var icons: [[IconSlot]]? = nil
+        /// Alanda birden çok ayrı yazı grubu varsa grupları; tek grupta nil (tek kutu).
+        var blocks: [Block]? = nil
     }
 
     private let reader: TextReader
@@ -139,7 +174,7 @@ public final class RegionWatcher {
         let started = now()
         let session = self.session
         let reader = self.reader
-        let reading = await Task.detached(priority: .utility) { try? reader.readLines(crop, deep: false) }.value
+        let reading = try? await ReadQueue.shared.run { try reader.readLines(crop, deep: false) }
         guard session == self.session else { return }
         guard let reading else {
             // OCR hatası boş alan değildir. Eski kutuyu koru; aynı kareyi sonraki normal turda yeniden oku.
@@ -152,7 +187,7 @@ public final class RegionWatcher {
         }
         reads += 1
         onReadMs?(now() - started)
-        let candidate = Self.candidate(reading, in: region)
+        let candidate = Self.candidate(reading, in: region, frame: crop)
         if state.lastRead == candidate.key {
             state.candidate = nil
             states[area.id] = state
@@ -165,19 +200,44 @@ public final class RegionWatcher {
     }
 
     /// Okumadan çevrilecek parçalar: kumanda ipuçları, yazı tanıma çöpleri ve harfsiz göstergeler ("23m", "9") atılır;
-    /// satırlar yukarıdan aşağı parçalara toplanır (başlık, cümle, madde).
-    static func candidate(_ reading: Reading, in region: CropRegion) -> Candidate {
-        let lines = reading.withoutButtonPrompts().withoutOcrNoise().lines
+    /// satırlar yukarıdan aşağı parçalara toplanır (başlık, cümle, madde). Yazının içindeki kumanda simgeleri `frame`'den
+    /// (okunan alan) kesilir; çeviride yerleri korunur.
+    static func candidate(_ reading: Reading, in region: CropRegion, frame: CGImage? = nil) -> Candidate {
+        let lines = reading.withButtonIcons().withoutButtonPrompts().withoutOcrNoise().lines
             .filter { ScreenTranslation.isWords($0.text) }
             .sorted { ($0.box?.top ?? 0) < ($1.box?.top ?? 0) }
-        let paragraphs = ScreenTranslation.paragraphs(lines)
+        var paragraphs = ScreenTranslation.paragraphs(lines)
         let place = TextBox(left: region.left, top: region.top, right: region.right, bottom: region.bottom)
         let boxes = lines.compactMap(\.box)
         let box = boxes.dropFirst().reduce(boxes.first) { $0?.union($1) }?.placed(in: place)
-        let heights = boxes.map { ($0.bottom - $0.top) * (region.bottom - region.top) }.sorted()
+        let height = region.bottom - region.top
+        let heights = boxes.map { ($0.bottom - $0.top) * height }.sorted()
         let lineHeight = heights.isEmpty ? nil : heights[heights.count / 2]
-        let key = TextMatch.normalize(paragraphs.joined(separator: " "))
-        return Candidate(paragraphs: paragraphs, box: box, lineHeight: lineHeight, key: key)
+        var key = TextMatch.normalize(paragraphs.joined(separator: " "))
+        var icons = ScreenTranslation.paragraphIcons(lines)
+        // Alanda birbirinden ayrı duran yazılar (başlık ile ayrı sütundaki hedef, alt alta iki bildirim) "Ekranı çevir"deki
+        // gibi gruplanır; her grubun çevirisi TV'de kendi yerine konur. Tek grupta (ya da yeri bilinmeyen satır varsa)
+        // eskisi gibi tek kutu. Anahtar grup yapısını da içerir: aynı yazı farklı gruplanırsa bloklar yeniden kurulur.
+        var blocks: [Block]?
+        let groups = lines.count > 1 && boxes.count == lines.count ? ScreenTranslation.groups(reading) : []
+        if groups.count > 1, groups.count < ScreenTranslation.maxGroups {
+            paragraphs = groups.flatMap(\.paragraphs)
+            icons = groups.flatMap { $0.icons ?? $0.paragraphs.map { _ in [IconSlot]() } }
+            var list: [Block] = []
+            var start = 0
+            for group in groups {
+                list.append(Block(start: start, count: group.paragraphs.count, box: group.box.placed(in: place),
+                                  lineHeight: group.lineHeight * height))
+                start += group.paragraphs.count
+            }
+            blocks = list
+            key = TextMatch.normalize(paragraphs.joined(separator: " ")) + "|" + list.map { String($0.count) }.joined(separator: ",")
+        }
+        var cut: [[IconSlot]]?
+        if let frame, icons.contains(where: { !$0.isEmpty }) {
+            cut = icons.map { ButtonIcons.withImages($0, frame: frame) }
+        }
+        return Candidate(paragraphs: paragraphs, box: box, lineHeight: lineHeight, key: key, icons: cut, blocks: blocks)
     }
 
     /// Kararlı yazı: öncekinden farklıysa çevrilip gönderilir, boşsa kutu kalkar.
@@ -186,10 +246,24 @@ public final class RegionWatcher {
         if state.shown == candidate.key {
             guard state.renderedKey == candidate.key,
                   let renderedText = state.renderedText, !renderedText.isEmpty else { return }
-            guard state.renderedBox != candidate.box || state.renderedLineHeight != candidate.lineHeight else { return }
-            server.sendRegion(id: area.id, text: renderedText, box: candidate.box, lineHeight: candidate.lineHeight)
+            guard state.renderedBox != candidate.box || state.renderedLineHeight != candidate.lineHeight
+                    || state.renderedLayout != candidate.blocks else { return }
+            // Aynı yazı kaydı: çeviriler korunur, bloklar yeni yerlerine taşınır (anahtar aynıysa grup sayısı da aynıdır).
+            var moved: [(group: Int, item: ScreenTranslation.Item)]?
+            if let rendered = state.renderedBlocks, let current = candidate.blocks {
+                moved = rendered.map { block -> (group: Int, item: ScreenTranslation.Item) in
+                    var item = block.item
+                    item.box = current[block.group].box
+                    item.lineHeight = current[block.group].lineHeight
+                    return (block.group, item)
+                }
+            }
+            server.sendRegion(id: area.id, text: renderedText, box: candidate.box, lineHeight: candidate.lineHeight,
+                              icons: state.renderedIcons, blocks: moved?.map(\.item))
             state.renderedBox = candidate.box
             state.renderedLineHeight = candidate.lineHeight
+            state.renderedLayout = candidate.blocks
+            state.renderedBlocks = moved
             states[area.id] = state
             return
         }
@@ -199,55 +273,89 @@ public final class RegionWatcher {
             server.sendRegion(id: area.id, text: "", box: nil, lineHeight: nil)
             states[area.id]?.renderedKey = candidate.key
             states[area.id]?.renderedText = ""
+            states[area.id]?.renderedIcons = nil
             states[area.id]?.renderedBox = nil
             states[area.id]?.renderedLineHeight = nil
             onLog?("ek alan \(area.name): boşaldı")
             return
         }
         let session = self.session
-        let translated: [String]
+        // Simgeler paket aramasında yok sayılır, çeviride uydurma adlarla korunur (`IconText`).
+        let prepared = candidate.paragraphs.map(IconText.protect)
+        let translated: [String?]
         var fromPack = 0
         do {
-            translated = try await translate(candidate.paragraphs, packHits: &fromPack)
+            translated = try await translate(candidate.paragraphs, prepared: prepared, packHits: &fromPack)
         } catch {
             guard session == self.session else { return }
             if states[area.id]?.shown == candidate.key {
                 states[area.id]?.shown = previousShown
                 states[area.id]?.candidate = candidate
             }
-            onLog?("ek alan \(area.name): \(SubtitleLog.excerpt(candidate.paragraphs.joined(separator: " "))) çevrilemedi (\(error))")
+            onLog?("ek alan \(area.name): \(SubtitleLog.excerpt(IconText.plain(candidate.paragraphs.joined(separator: " ")))) çevrilemedi (\(error))")
             return
         }
         guard session == self.session, states[area.id]?.shown == candidate.key else { return }
-        let text = zip(candidate.paragraphs, translated).map { source, translation in
-            let trimmed = translation.trimmingCharacters(in: .whitespacesAndNewlines)
-            return trimmed.isEmpty ? source : trimmed
+        var slots: [IconSlot] = []
+        var text: [String] = []
+        for (index, source) in candidate.paragraphs.enumerated() {
+            let trimmed = (index < translated.count ? translated[index] : nil)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            text.append(trimmed.isEmpty ? IconText.indexed(source, offset: slots.count)
+                        : IconText.restore(trimmed, names: prepared[index].names, offset: slots.count))
+            if let all = candidate.icons, index < all.count { slots += all[index] }
         }
         // Çevirisi aslıyla aynı (ad, sayı, zaten hedef dilde): kutu gösterilmez.
-        let same = zip(candidate.paragraphs, text).allSatisfy {
-            TextMatch.isSimilar(TextMatch.normalize($0), TextMatch.normalize($1), threshold: 0.90)
+        let similar = zip(candidate.paragraphs, text).map {
+            TextMatch.isSimilar(TextMatch.normalize(IconText.plain($0)), TextMatch.normalize(IconText.plain($1)), threshold: 0.90)
         }
-        if same {
+        if similar.allSatisfy({ $0 }) {
             server.sendRegion(id: area.id, text: "", box: nil, lineHeight: nil)
             states[area.id]?.renderedKey = candidate.key
             states[area.id]?.renderedText = ""
+            states[area.id]?.renderedIcons = nil
             states[area.id]?.renderedBox = nil
             states[area.id]?.renderedLineHeight = nil
+            states[area.id]?.renderedLayout = nil
+            states[area.id]?.renderedBlocks = nil
             return
         }
-        let joined = text.joined(separator: "\n")
         let origin = fromPack == candidate.paragraphs.count ? "paket" : fromPack > 0 ? "paket+motor" : "motor"
-        onLog?("ek alan \(area.name): \(SubtitleLog.excerpt(candidate.paragraphs.joined(separator: " "))) → \(origin)")
-        server.sendRegion(id: area.id, text: joined, box: candidate.box, lineHeight: candidate.lineHeight)
+        onLog?("ek alan \(area.name): \(SubtitleLog.excerpt(IconText.plain(candidate.paragraphs.joined(separator: " ")))) → \(origin)")
+        let rendered = IconText.render(text.joined(separator: "\n"), slots: slots)
+        let icons = rendered.icons.isEmpty ? nil : rendered.icons
+        let blocks = candidate.blocks.map { Self.renderBlocks(candidate, layout: $0, text: text, similar: similar, slots: slots) }
+        server.sendRegion(id: area.id, text: rendered.text, box: candidate.box, lineHeight: candidate.lineHeight, icons: icons,
+                          blocks: blocks?.map(\.item))
         states[area.id]?.renderedKey = candidate.key
-        states[area.id]?.renderedText = joined
+        states[area.id]?.renderedText = rendered.text
+        states[area.id]?.renderedIcons = icons
         states[area.id]?.renderedBox = candidate.box
         states[area.id]?.renderedLineHeight = candidate.lineHeight
+        states[area.id]?.renderedLayout = candidate.blocks
+        states[area.id]?.renderedBlocks = blocks
     }
 
-    /// Parçalar önce pakette aranır; kalanlar çeviri motoruna gider (yapay zekâda tek istekte).
-    private func translate(_ paragraphs: [String], packHits: inout Int) async throws -> [String] {
-        var result = paragraphs.map { packLookup?($0)?.text }
+    /// Her grubun çevirisi kendi yeriyle. Çevirisi aslıyla aynı grup (ad, sayı) atlanır; İngilizcesi görünür kalır.
+    /// `text` simge imlerini bütün alanın sırasıyla taşır; `slots` o sıradaki simgeler.
+    static func renderBlocks(_ candidate: Candidate, layout: [Block], text: [String], similar: [Bool],
+                             slots: [IconSlot]) -> [(group: Int, item: ScreenTranslation.Item)] {
+        var result: [(group: Int, item: ScreenTranslation.Item)] = []
+        for (index, block) in layout.enumerated() {
+            let range = block.start..<(block.start + block.count)
+            if range.allSatisfy({ similar[$0] }) { continue }
+            let rendered = IconText.render(range.map { text[$0] }.joined(separator: "\n"), slots: slots)
+            let source = range.map { IconText.plain(candidate.paragraphs[$0]) }.joined(separator: "\n")
+            result.append((index, ScreenTranslation.Item(source: source, translation: rendered.text, box: block.box,
+                                                          lineHeight: block.lineHeight,
+                                                          icons: rendered.icons.isEmpty ? nil : rendered.icons)))
+        }
+        return result
+    }
+
+    /// Parçalar önce pakette aranır; kalanlar çeviri motoruna gider (yapay zekâda tek istekte). Motora simgeleri adlarla
+    /// korunmuş metin (`prepared`) gider. Çevrilemeyen parça nil kalır.
+    private func translate(_ paragraphs: [String], prepared: [IconText.Protected], packHits: inout Int) async throws -> [String?] {
+        var result = paragraphs.map { packLookup?(IconText.plain($0))?.text }
         packHits = result.compactMap { $0 }.count
         // Zaten Türkçe olan parça çevrilmez: aslı kalır, tümü öyleyse kutu gösterilmez.
         for index in result.indices where result[index] == nil && skipsTurkish && TurkishText.isSure(paragraphs[index]) {
@@ -255,12 +363,12 @@ public final class RegionWatcher {
         }
         let missing = result.indices.filter { result[$0] == nil }
         if !missing.isEmpty {
-            let texts = missing.map { paragraphs[$0] }
+            let texts = missing.map { prepared[$0].text }
             let translations = translator.translatesTogether ? try await translator.translateAll(texts)
                 : try await sequential(texts)
             for (index, translation) in zip(missing, translations) { result[index] = translation }
         }
-        return zip(paragraphs, result).map { $1 ?? $0 }
+        return result
     }
 
     private func sequential(_ texts: [String]) async throws -> [String] {

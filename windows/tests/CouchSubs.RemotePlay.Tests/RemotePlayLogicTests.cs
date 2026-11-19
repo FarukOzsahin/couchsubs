@@ -65,6 +65,25 @@ public class StaleSessionEventTests
     }
 }
 
+/// <summary>Kullanıcı PS5'i kapatınca (dinlenme modu) yeniden bağlanma döngüsü PS5'i yeniden açmamalı; eskiden açıyordu ve
+/// PS5 kapatılmış görünürken "PS5 bağlı" görünüyordu.</summary>
+public class WakePolicyTests
+{
+    [Fact]
+    public void WakesOnlyBeforeFirstConnection()
+    {
+        var policy = new WakePolicy();
+        Assert.Equal(WakePolicy.Action.Wake, policy.Decide(false));
+        Assert.Equal(WakePolicy.Action.Connect, policy.Decide(true));
+        Assert.Equal(WakePolicy.Action.Connect, policy.Decide(null));
+        policy.Streamed();
+        Assert.Equal(WakePolicy.Action.WaitUntilOn, policy.Decide(false));
+        Assert.Equal(WakePolicy.Action.Connect, policy.Decide(true));
+        policy.Reset();
+        Assert.Equal(WakePolicy.Action.Wake, policy.Decide(false));
+    }
+}
+
 public class ReconnectPolicyTests
 {
     [Fact]
@@ -83,6 +102,65 @@ public class ReconnectPolicyTests
         policy.Reset();
         Assert.Equal(2, policy.NextDelay());
     }
+
+    /// <summary>PS5 oturumu açılıp birkaç saniyede düşürüyorsa aralık sıfırlanmaz (eskiden her bağlanışta 2 sn'ye dönüyordu,
+    /// PS5'te ikinci hesap durmadan girip çıkıyordu). Uzun süren oturumdan sonra baştan başlar.</summary>
+    [Fact]
+    public void ShortSessionsKeepBackingOff()
+    {
+        var policy = new ReconnectPolicy();
+        Assert.Equal(2, policy.NextDelay());
+        policy.Connected(10_000);
+        policy.Ended(14_000);
+        Assert.Equal(4, policy.NextDelay());
+        policy.Connected(20_000);
+        policy.Ended(20_000 + (long)ReconnectPolicy.StableAfter.TotalMilliseconds);
+        Assert.Equal(2, policy.NextDelay());
+    }
+
+    [Fact]
+    public void InUseWaitsAtLeastEightSeconds()
+    {
+        var policy = new ReconnectPolicy();
+        Assert.Equal([8, 16, 30], Enumerable.Range(0, 3).Select(_ => policy.NextDelay(inUse: true)));
+    }
+}
+
+public class QualityFallbackTests
+{
+    /// <summary>Kablosuz ağda akış sık kopuyordu (GitHub #388, #401): on dakikada iki kopmadan sonra 720p istenir.</summary>
+    [Fact]
+    public void TwoDropsWithinWindowLowerTo720p()
+    {
+        var quality = new QualityFallback();
+        Assert.False(quality.Dropped(0));
+        Assert.False(quality.Lowered);
+        Assert.True(quality.Dropped(120_000));
+        Assert.True(quality.Lowered);
+        // Bir kez düşürülür; sonraki kopmalar yeniden bildirmez.
+        Assert.False(quality.Dropped(130_000));
+        Assert.True(quality.Lowered);
+    }
+
+    [Fact]
+    public void DropsFarApartKeep1080p()
+    {
+        var quality = new QualityFallback();
+        var window = (long)QualityFallback.Window.TotalMilliseconds;
+        Assert.False(quality.Dropped(0));
+        Assert.False(quality.Dropped(window + 1));
+        Assert.False(quality.Dropped(2 * window + 2));
+        Assert.False(quality.Lowered);
+    }
+
+    [Theory]
+    [InlineData(DisconnectKind.Network, true)]
+    [InlineData(DisconnectKind.Other, true)]
+    [InlineData(DisconnectKind.InUse, false)]
+    [InlineData(DisconnectKind.Rejected, false)]
+    [InlineData(DisconnectKind.RegistrationInvalid, false)]
+    [InlineData(DisconnectKind.Stopped, false)]
+    public void OnlyNetworkLikeDropsCount(DisconnectKind kind, bool counts) => Assert.Equal(counts, QualityFallback.CountsAsDrop(kind));
 }
 
 public class PictureWatchdogTests
@@ -205,6 +283,8 @@ public class DisconnectReasonTests
     [Theory]
     [InlineData("Reported Application Reason: 0x80108b09 (Regist failed, probably invalid PIN)", DisconnectKind.RegistrationInvalid)]
     [InlineData("Reported Application Reason: 0x80108B02 (Invalid PSN ID)", DisconnectKind.RegistrationInvalid)]
+    // PS5 bu cihazın kayıt anahtarını eşli cihazlarında bulamadı: yeniden eşlenmeli (sonsuz yeniden deneme yok).
+    [InlineData("Reported Application Reason: 0x80108b26 (unknown)", DisconnectKind.RegistrationInvalid)]
     [InlineData("Session request connect failed eventually.", DisconnectKind.Network)]
     [InlineData("Failed to receive session request response", DisconnectKind.Network)]
     [InlineData("Failed to send session request", DisconnectKind.Network)]
@@ -216,6 +296,12 @@ public class DisconnectReasonTests
     public void OtherApplicationReasonIsRejection() =>
         Assert.Equal(new DisconnectReason(DisconnectKind.Rejected, "0x80108bff"),
                      DisconnectReasons.SessionRequestHint("Reported Application Reason: 0x80108bff (unknown)"));
+
+    /// <summary>0x80108b12: PS5'te Uzaktan Oynatma kapalı (GitHub #9); kod ayrıntıda, ekranda ayarın yolu gösterilir.</summary>
+    [Fact]
+    public void RemotePlayDisabledKeepsItsCode() =>
+        Assert.Equal(new DisconnectReason(DisconnectKind.Rejected, ApplicationReasons.RemotePlayDisabled),
+                     DisconnectReasons.SessionRequestHint("Reported Application Reason: 0x80108b12 (unknown)"));
 
     [Theory]
     [InlineData("Reported Application Reason: garbage")]
@@ -325,10 +411,21 @@ public class RegistrationReasonTests
     {
         var a = new ConsoleInfo("192.168.1.20", "PS5-A", true);
         var b = new ConsoleInfo("192.168.1.21", "PS5-B", true);
-        Assert.Equal(a, ConsoleDiscovery.PickMoved([a], "other name"));
+        // Ağda tek PS5 olsa bile adı tutmuyorsa başka evin/odanın PS5'idir (GitHub #425).
+        Assert.Null(ConsoleDiscovery.PickMoved([a], "other name"));
+        Assert.Equal(a, ConsoleDiscovery.PickMoved([a], "PS5-A"));
         Assert.Equal(b, ConsoleDiscovery.PickMoved([a, b], "PS5-B"));
         Assert.Null(ConsoleDiscovery.PickMoved([a, b], "other name"));
         Assert.Null(ConsoleDiscovery.PickMoved([], "PS5-A"));
+    }
+
+    [Fact]
+    public void OtherConsoleAtSavedAddressIsNotTheRegisteredOne()
+    {
+        var a = new ConsoleInfo("192.168.1.20", "PS5-A", true);
+        Assert.True(ConsoleDiscovery.IsRegistered(a, "PS5-A"));
+        Assert.False(ConsoleDiscovery.IsRegistered(a, "PS5-B"));
+        Assert.True(ConsoleDiscovery.IsRegistered(a, ""));
     }
 
     [Fact]

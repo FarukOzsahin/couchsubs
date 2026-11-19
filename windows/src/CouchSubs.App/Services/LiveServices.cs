@@ -28,9 +28,9 @@ public sealed class LiveServices : IAppServices
     // Her model kendi önbelleğini kullanır ("gemini:gemini-3.5-flash-lite"); model değişince eski çeviriler karışmaz.
     // Ek talimat aynı önbellekte kalır; anahtar talimatın etiketiyle ayrılır (bkz. AiTranslator.CacheKey).
     public ITextTranslator? MakeAiTranslator(AiProvider provider, string key, string model, ITextTranslator? fallback, Func<string?>? game,
-                                             string? instruction = null) =>
+                                             string? instruction = null, bool paidTier = false) =>
         new AiTranslator(provider, key, model, fallback, cache: TranslationCache.Shared(AppPaths.Translations, provider.EngineId(model), "en", "tr"),
-                         game: game, instruction: instruction);
+                         game: game, instruction: instruction, paidTier: paidTier);
 
     public Task<AiTestResult> TestAiKeyAsync(AiProvider provider, string key, string model) => AiTranslator.TestAsync(provider, key, model);
 
@@ -89,7 +89,18 @@ public sealed class LiveServices : IAppServices
         if (tv.Brand == TvBrand.Samsung)
         {
             using var samsung = new SamsungClient(tv, key);
-            var token = await samsung.ConnectAsync();
+            string token;
+            try { token = await samsung.ConnectAsync(); }
+            catch (Exception error) when (error is not SsapException { Reason: "rejected" })
+            {
+                if (await SamsungDiscovery.DeveloperInfoAsync(tv.Host) is null) throw;
+                // TV uzaktan kumanda iznini sormadı ya da izin 60 saniyede gelmedi (The Frame'de Sanat Modu, izin kutusu
+                // kapalı TV'ler); TV ağda yanıt veriyor. Eşleşme durmaz: TV uygulaması geliştirici bağlantısıyla (sdb)
+                // kurulup açılır. Önceden "Bağlan" bir dakika bekleyip başa dönüyor, kurulum adımına hiç geçilmiyordu.
+                new TvInstall.InstallLog(TvInstallLogPath).Write(
+                    $"Samsung uzaktan kumanda izni alınamadı ({error.GetType().Name}: {error.Message}); TV 8001'de yanıt verdi, eşleşme izinsiz sürdü.");
+                return new TvPairing(key ?? "", true);
+            }
             try { await samsung.LaunchAsync(SamsungClient.AppId, new Dictionary<string, string> { ["server"] = server }); }
             catch (Exception) { /* TV uygulaması bilgisayarı kendisi de bulabilir */ }
             return new TvPairing(token, true);
@@ -136,7 +147,10 @@ public sealed class LiveServices : IAppServices
                     throw;
                 }
             }, () => SamsungDiscovery.SearchAsync(), onMoved);
-            return new Keeper(new TvKeeper(samsungLocator.ConnectAsync, SamsungClient.AppId, parameters, appConnected));
+            // Önce geliştirici bağlantısı (sdb) denenir; uzaktan kumanda bağlantısıyla açma bazı TV'lerde sessizce çalışmıyordu.
+            var host = tv.Host;
+            return new Keeper(new TvKeeper(() => Task.FromResult<ITvControl>(new SamsungLauncher(() => OpenSamsungAppAsync(host), samsungLocator.ConnectAsync)),
+                SamsungClient.AppId, parameters, appConnected));
         }
         var locator = new TvLocator(tv, async target =>
         {
@@ -226,19 +240,59 @@ public sealed class LiveServices : IAppServices
 
     public Task<bool> IsSamsungDevModeOnAsync(string host) => SamsungTvInstaller.IsDevModeOnAsync(host);
 
+    /// <summary>
+    /// Kurulu TV uygulamasını geliştirici bağlantısıyla (sdb) açar. Geliştirici modu kapalıysa, Host PC IP başka
+    /// bilgisayarınsa ya da TV açmadıysa false döner.
+    /// </summary>
+    private static async Task<bool> OpenSamsungAppAsync(string host)
+    {
+        if (string.IsNullOrEmpty(host) || !await SamsungTvInstaller.IsDevModeOnAsync(host)) return false;
+        using var http = new HttpClient { Timeout = TimeSpan.FromSeconds(30) };
+        var log = new TvInstall.InstallLog(TvInstallLogPath);
+        var installer = new SamsungTvInstaller(host, DataDirectory("samsung"), new SamsungCertificates(http, log)) { Log = log };
+        try
+        {
+            return await Task.Run(() => installer.OpenAsync());
+        }
+        catch (Exception error)
+        {
+            log.Write($"Uygulama açılamadı: {error.Message}");
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// Bekçinin Samsung'da TV uygulamasını açma yolu: önce geliştirici bağlantısı (sdb), olmazsa uzaktan kumanda
+    /// bağlantısı (8002, ilk bağlantıda TV izin sorar). Samsung önplandaki uygulamayı söylemez; bekçi yalnız açar.
+    /// </summary>
+    private sealed class SamsungLauncher(Func<Task<bool>> openWithSdb, Func<Task<ITvControl>> connectRemote) : ITvControl
+    {
+        public async Task LaunchAsync(string appId, IReadOnlyDictionary<string, string> parameters, CancellationToken cancellationToken = default)
+        {
+            if (await openWithSdb()) return;
+            using var remote = await connectRemote();
+            await remote.LaunchAsync(appId, parameters, cancellationToken);
+        }
+
+        public Task<string> ForegroundAppIdAsync(CancellationToken cancellationToken = default) => Task.FromResult("");
+
+        public void Dispose() { }
+    }
+
     public async Task<SamsungPreflight> CheckSamsungAsync(string host)
     {
         var info = await SamsungDiscovery.DeveloperInfoAsync(host);
         return new SamsungPreflight(info, AppController.LocalAddress(host));
     }
 
-    public async Task<(string Version, bool Installed)> InstallSamsungAppAsync(string host, BundledTvApp app, Action<TvInstallEvent> onEvent)
+    public async Task<(string Version, bool Installed)> InstallSamsungAppAsync(string host, BundledTvApp app, bool openIfInstalled, Action<TvInstallEvent> onEvent)
     {
         using var http = new HttpClient { Timeout = TimeSpan.FromMinutes(1) };
         var log = new TvInstall.InstallLog(TvInstallLogPath);
         var installer = new SamsungTvInstaller(host, DataDirectory("samsung"), new SamsungCertificates(http, log))
         {
             Log = log,
+            OpenIfInstalled = openIfInstalled,
             Progress = step => onEvent(new TvInstallEvent(TvInstallEventKind.Progress, Step: step)),
             SignIn = token => SamsungLogin.SignInAsync(url => onEvent(new TvInstallEvent(TvInstallEventKind.SignIn, new Uri(url))),
                 TimeSpan.FromMinutes(10), token),
@@ -282,18 +336,22 @@ public sealed class LiveServices : IAppServices
 
     public Task<IReadOnlyList<string>> ScanAndroidTvsAsync() => AndroidTvInstaller.ScanAsync();
 
-    public async Task<string> InstallAndroidAppAsync(string host, BundledTvApp app, Action<TvInstallEvent> onEvent)
+    public async Task<string> InstallAndroidAppAsync(string host, BundledTvApp app, bool openIfInstalled, Action<TvInstallEvent> onEvent)
     {
+        void Approve() => onEvent(new TvInstallEvent(TvInstallEventKind.ApproveOnTv));
         var installer = new AndroidTvInstaller(host, DataDirectory("adb"))
         {
-            OnApprovalNeeded = () => onEvent(new TvInstallEvent(TvInstallEventKind.ApproveOnTv)),
+            OnApprovalNeeded = Approve,
             // CouchSubs TV Play'de ve TV'de Play Store varsa TV'de Play sayfası açılır (PlayStoreRedirect.cs).
             PlayListed = AndroidTvInstaller.IsListedOnPlayAsync,
             OnPlayOpened = () => onEvent(new TvInstallEvent(TvInstallEventKind.Progress, Step: "play")),
         };
         try
         {
-            var (version, _) = await Task.Run(() => installer.EnsureInstalledAsync(app.Path, app.Version));
+            // TV'den kaldırılıp kaydı kalan uygulama da kurulur (AndroidTvApp.cs); "yeniden kur"da güncel uygulama açılır.
+            var log = new TvInstall.InstallLog(TvInstallLogPath);
+            var (version, _) = await Task.Run(() => TvInstall.AndroidTvApp.EnsureInstalledAsync(installer, host, DataDirectory("adb"), app.Path,
+                app.Version, openIfInstalled, Approve, log.Write));
             return version;
         }
         catch (AndroidInstallException error)
@@ -440,7 +498,16 @@ public sealed class LiveServices : IAppServices
 
         public async Task DownloadAsync(string source, string target, IProgress<double> progress, CancellationToken cancellationToken)
         {
-            await englishTurkish.DownloadAsync(progress, cancellationToken);
+            try
+            {
+                await englishTurkish.DownloadAsync(progress, cancellationToken);
+            }
+            catch (Exception error) when (error is not OperationCanceledException)
+            {
+                // Ekran yalnız "internet bağlantınızı kontrol edin" der; asıl neden (TLS, disk, antivirüs, özet) hata.log'da kalsın.
+                StartupGuard.Log("Ücretsiz çeviri modeli indirilemedi", error);
+                throw;
+            }
             // Önceki sürümlerin ONNX modeli (yaklaşık 530 MB) artık kullanılmaz; yeni model kurulunca silinir.
             try
             {

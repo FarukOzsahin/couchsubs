@@ -20,7 +20,8 @@
     <string name="phase_reconnecting">Connection lost, reconnecting…</string>
     <string name="phase_in_use">PS5 is in another Remote Play session. Close the other device.</string>
     <string name="phase_not_found_host">PS5 not found at %1$s. Make sure it is on and on the same network. Reconnecting…</string>
-    <string name="phase_network">Can\'t reach the PS5. Reconnecting…</string>
+    <string name="phase_network">Lost the connection to the PS5. Reconnecting… If this keeps happening, connect the PS5 to the router with a cable.</string>
+    <string name="phase_remote_play_disabled">Remote Play is turned off on the PS5 (code %1$s). On the PS5, go to Settings › System › Remote Play and turn on Enable Remote Play.</string>
     <string name="phase_rejected_code">The PS5 rejected the connection (code %1$s). Another Remote Play app (PS Remote Play) may be open, or the PS5 may be in another session. Close PS Remote Play, restart the PS5, then try again.</string>
     <string name="phase_rejected">The PS5 didn\'t start the session. Another Remote Play app (PS Remote Play) may be open, or the PS5 may be in another session. Close PS Remote Play, restart the PS5, then try again.</string>
     <string name="phase_registration_invalid">The PS5 didn\'t accept this pairing. Pair the PS5 again with the second account in Settings.</string>
@@ -35,10 +36,14 @@
     <string name="error_native">The Remote Play library could not be loaded on this device.</string>
     <string name="error_port">The subtitle server could not start (port 8787 is in use).</string>
     <string name="error_translation">Translation is unavailable right now; retrying.</string>
-    <string name="error_model">The free translation model could not be downloaded. Check your internet connection.</string>
+    <string name="error_model">The free translation model could not be downloaded. Try again and share the error log if it persists.</string>
+    <string name="error_model_network">The translation model download failed due to a network issue. Check your connection and DNS/VPN settings, then try again.</string>
+    <string name="error_model_storage">There is not enough free storage to download the translation model. Free up space and try again.</string>
+    <string name="error_model_unavailable">The translation model service is temporarily unavailable. Check Google Play services updates and try again.</string>
+    <string name="error_model_timeout">The translation model download timed out. Check your connection and try again.</string>
     <string name="screen_translate">Translate screen</string>
-    <string name="screen_working">Translating the screen…</string>
-    <string name="screen_remove">Remove screen translations</string>
+    <string name="screen_working">Translating…</string>
+    <string name="screen_remove">Remove translations</string>
     <string name="screen_translating">Translating the screen…</string>
     <string name="screen_none">No text found on the screen.</string>
     <string name="screen_no_picture">Couldn\'t capture the screen: no picture from the PS5 yet.</string>
@@ -76,6 +81,7 @@
     <string name="psn_problem_crashed">The in-app browser (Android System WebView) didn\'t work. Try updating it from the Play Store.</string>
     <string name="psn_problem_other">Something went wrong while loading the page.</string>
     <string name="pair_title">Pair your PS5</string>
+    <string name="pair_hide_status">To hide the \"Remote Play connected\" message on the screen: on the PS5, go to Settings › System › Remote Play and turn on Hide Remote Play Connection Status Pop-Up. Do it for both your main account and the second account.</string>
     <string name="pair_body">On the PS5, with the second account, choose Settings › System › Remote Play › Pair Device and enter the code shown.</string>
     <string name="pair_searching">Looking for PS5…</string>
     <string name="pair_address">PS5 address (e.g. 192.168.1.20)</string>
@@ -89,7 +95,7 @@
     <string name="target_phone">On this phone</string>
     <string name="target_tvs_none">No TV seen on the network (it may be off; that\'s fine).</string>
 
-    <string name="main_phone_view">Show subtitles on the phone</string>
+    <string name="main_phone_view">Subtitle screen</string>
     <string name="main_target">Subtitles</string>
     <string name="main_target_tv">TV</string>
     <string name="main_target_phone">This phone</string>
@@ -150,6 +156,9 @@
     <string name="settings_display_mode_note">If the PS5 picture stays black inside the CouchSubs TV app, choose Overlay: the TV shows the PS5 on its own HDMI input and the subtitles appear on top. If no picture arrives, the TV app first lists its HDMI inputs and switches to Overlay where it can. The TV app from Google Play has no Overlay mode: there this choice is not applied and the TV says so on screen.</string>
     <string name="settings_screen_on">Keep screen on</string>
     <string name="close">Close</string>
+    <!-- Kendi ürünlerimizin tanıtım popup'ı (promo.json) -->
+    <string name="promo_label">Sponsored</string>
+    <string name="promo_open">Open link</string>
     <string name="ok">OK</string>
     <string name="next_continue">Continue</string>
     <string name="setup_step">Setup · Step %1$d/3</string>
@@ -245,7 +254,7 @@
     <string name="settings_fast_reading">Check unchanged subtitle areas more often</string>
     <string name="settings_fast_reading_short">When the subtitle area looks unchanged, read it again after 2 frames instead of 20. Uses more CPU.</string>
     <string name="settings_xbox_audio">Play Xbox sound on this device</string>
-    <string name="settings_xbox_audio_short">Xbox remote play sends the sound to this device; if you turn this off, the game may stay silent.</string>
+    <string name="settings_xbox_audio_short">While remote play is running, the Xbox mutes the TV and sends game sound only to this device (an Xbox limitation). If you turn this off, the game has no sound. To hear it from the TV or speakers, connect this phone to a Bluetooth speaker or headphones.</string>
     <string name="running_now">Now</string>
     <string name="running_ready_translation">ready translation</string>
     <string name="running_ready">ready</string>
@@ -415,6 +424,8 @@
     <string name="tvinstall_android_wireless_step3">3. The first time, press “Pair device with pairing code”; type the IP address and port from that window together with the 6-digit code, and press Install and open while the window is still open.</string>
     <string name="tvinstall_android_replace">Remove the TV\'s copy and install</string>
     <string name="tvinstall_android_err_unreachable">The TV did not respond. Make sure the TV is on and on the same Wi-Fi as this phone, and that debugging is on in its developer options. With wireless debugging the port changes every time; type the one on the screen.</string>
+    <string name="tvinstall_android_try_wireless">Try with wireless debugging</string>
+    <string name="tvinstall_android_err_legacy_closed">The TV did not answer on the USB/network debugging port (5555). Newer Android TV and Google TV models keep this port closed. On the TV, turn on Developer options › Wireless debugging, then tap the button below.</string>
     <string name="tvinstall_android_err_not_approved">Debugging was not allowed on the TV. Try again and choose Allow on the TV.</string>
     <string name="tvinstall_android_err_not_paired">The TV does not know this phone. With wireless debugging, pair first: press “Pair device with pairing code” on the TV, type the address and the code from that window and try again.</string>
     <string name="tvinstall_android_err_pairing">Pairing failed: the code is wrong or the pairing window on the TV closed. Open the window again, type the new code and port and try again.</string>
@@ -424,9 +435,10 @@
     <string name="history">History</string>
     <string name="history_note">The last %1$d translated lines are kept on this phone.</string>
     <string name="history_empty">No subtitles yet. Lines translated in this and earlier sessions appear here.</string>
-    <string name="history_copy_all">Copy all</string>
     <string name="history_copied">Copied</string>
     <string name="history_copy">Copy</string>
+    <string name="developer_label">Developer</string>
+    <string name="developer_a11y">Developer: Enmera</string>
     <string name="history_clear">Clear</string>
     <string name="history_clear_title">Clear the history?</string>
     <string name="history_clear_body">All saved lines are removed from this phone.</string>
@@ -445,6 +457,7 @@
     <string name="area_drag_note_free">Drag the frame to move it, or drag an edge or corner to resize it.</string>
     <string name="area_preview_empty">The game picture appears here once translating starts.</string>
     <string name="extra_title">Extra areas</string>
+    <string name="extra_full_screen_note">Extra areas aren\'t read while the subtitle area is Full screen, because the whole screen is already read. They\'re read again when you pick another area.</string>
     <string name="extra_note">Besides the subtitle, CouchSubs can keep reading up to three small areas, like a quest, a phone message or a notification. Each area is read about once a second and translated again only when its text changes. The translation shows on the TV and on this phone\'s subtitle screen, where the original text is.</string>
     <string name="extra_add">Add extra area</string>
     <string name="extra_name">Area name</string>

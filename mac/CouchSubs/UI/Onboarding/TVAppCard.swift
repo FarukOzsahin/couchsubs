@@ -35,6 +35,18 @@ struct TVAppCard: View {
                     } else if brand == .samsung {
                         HintText(text: "If the TV keeps switching to HDMI 1 or another source while the CouchSubs TV app is open, turn off Anynet+ (HDMI-CEC) and Auto Source Switching on the TV: Settings › All Settings › Connection › External Device Manager.")
                     }
+                    // Uygulama "hazır" görünüp TV'de yoksa ya da açılmıyorsa (TV uygulaması bağlı değil) yeniden kurulabilir (#352, #389).
+                    if model.canReinstallTVApp {
+                        Button("Reinstall the TV app") { Task { await model.reinstallTVApp() } }.buttonStyle(.secondary)
+                    }
+                }
+            case .pressInstallOnTV:
+                Card(title: "CouchSubs TV app") {
+                    Text("The Google Play page opened on the TV: press Install (or Update) with the TV remote. The app opens by itself once it is installed.")
+                    HStack(spacing: Theme.space("s")) {
+                        ProgressView().controlSize(.small)
+                        Text("Waiting for the TV…").foregroundStyle(Color.csSecondary)
+                    }
                 }
             case .devModeOff:
                 devModeSteps
@@ -82,8 +94,22 @@ struct TVAppCard: View {
                     // TV bu Mac'i kabul etmediyse Host PC IP'ye yazılacak adres de görünür (#343).
                     if brand == .samsung, error == .unreachable {
                         HintText(text: "This computer's address (Host PC IP): \(model.computerAddress ?? "?")")
+                        otherAddresses
                     }
                     Button("Try again") { Task { await model.refreshTVApp() } }.buttonStyle(.secondary)
+                }
+            case .chooseAndroidTV(let hosts):
+                // Aynı ağda iki Android TV: izin sorusu yanlış odadaki TV'de çıkmasın diye TV sorulur (#425).
+                Card(title: "CouchSubs TV app") {
+                    Text("More than one Android TV with debugging on was found on the network. Which one is yours?")
+                    HintText(text: "You can see the TV's address on the TV in Settings › Network & Internet.")
+                    ForEach(hosts, id: \.self) { host in
+                        Button(String(format: String(localized: "Install on the TV at %@"), host)) {
+                            Task { await model.chooseAndroidTV(host) }
+                        }
+                        .buttonStyle(.secondary)
+                    }
+                    Button("Search again") { Task { await model.refreshTVApp() } }.buttonStyle(.secondary)
                 }
             case .hostPcMismatch(let tvIp, let computer):
                 Card(title: "CouchSubs TV app") {
@@ -91,6 +117,7 @@ struct TVAppCard: View {
                     HintText(text: "1. On the TV, open Apps and scroll to the very bottom of the page.")
                     HintText(text: "2. There, press 1 2 3 4 5 on the remote (or type 12345 on the on-screen keypad). The Developer Mode window opens.")
                     HintText(text: "3. Turn Developer mode On, type this computer's address as Host PC IP: \(computer) and press OK.")
+                    otherAddresses
                     HintText(text: "4. Restart the TV: hold the power button on the remote for about 2 seconds until the TV turns off, then turn it on again. This screen continues by itself.")
                     Button("Try again") { Task { await model.refreshTVApp() } }.buttonStyle(.secondary)
                 }
@@ -102,6 +129,15 @@ struct TVAppCard: View {
                     }
                 }
             }
+        }
+    }
+
+    /// Wi-Fi ve Ethernet ikisi de bağlıysa ya da birden çok ağ varsa Host PC IP için diğer adresler de yazılır.
+    @ViewBuilder
+    private var otherAddresses: some View {
+        let others = model.otherComputerAddresses
+        if !others.isEmpty {
+            HintText(text: "If the TV does not accept this address, try one of this computer's other addresses: \(others.joined(separator: ", "))")
         }
     }
 
@@ -124,6 +160,7 @@ struct TVAppCard: View {
                 HintText(text: "1. On the TV, open Apps and scroll to the very bottom of the page.")
                 HintText(text: "2. There, press 1 2 3 4 5 on the remote (or type 12345 on the on-screen keypad). The Developer Mode window opens.")
                 HintText(text: "3. Turn Developer mode On, type this computer's address as Host PC IP: \(model.computerAddress ?? "?") and press OK.")
+                otherAddresses
                 HintText(text: "4. Restart the TV: hold the power button on the remote for about 2 seconds until the TV turns off, then turn it on again. This screen continues by itself.")
                 HintText(text: "Later you sign in once with a free Samsung account; Samsung needs it to sign the app for your TV.")
                 HintText(text: "If the TV keeps switching to HDMI 1 or another source while the CouchSubs TV app is open, turn off Anynet+ (HDMI-CEC) and Auto Source Switching on the TV: Settings › All Settings › Connection › External Device Manager.")

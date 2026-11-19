@@ -21,7 +21,7 @@ import com.couchsubs.mobile.account.Backend
 import com.couchsubs.mobile.account.Telemetry
 import com.couchsubs.mobile.core.CropRegion
 import com.couchsubs.mobile.core.DemoTranslator
-import com.couchsubs.mobile.core.active
+import com.couchsubs.mobile.core.watched
 import com.couchsubs.mobile.core.GamePackLibrary
 import com.couchsubs.mobile.core.GameSense
 import com.couchsubs.mobile.core.LinePool
@@ -53,6 +53,8 @@ import com.couchsubs.mobile.translation.AiTranslator
 import com.couchsubs.mobile.translation.DeepLTranslator
 import com.couchsubs.mobile.translation.Glossary
 import com.couchsubs.mobile.translation.MlKitTranslator
+import com.couchsubs.mobile.translation.ModelDownloadProblem
+import com.couchsubs.mobile.translation.ModelDownloadRecovery
 import com.couchsubs.mobile.translation.TranslationCache
 import com.couchsubs.mobile.ui.MainActivity
 import com.couchsubs.mobile.xbox.XboxError
@@ -266,7 +268,7 @@ class TranslationService : Service() {
         glossaryInUse = glossary
         val free = MlKitTranslator(cache(MlKitTranslator.ENGINE_ID), glossary).also { freeTranslator = it }
         val translator = engineTranslator(free)
-        val subtitleServer = SubtitleServer().also { server = it }
+        val subtitleServer = SubtitleServer(instanceId = installationId(this)).also { server = it }
         subtitleServer.sendsToTv = settings.target == SubtitleTarget.TV
         subtitleServer.onClientsChanged = { count ->
             val before = LiveState.status.value.connectedTvs
@@ -281,10 +283,10 @@ class TranslationService : Service() {
         // Çeviri sürerken hedef TV'ye (ya da telefona) çevrilirse altyazı hemen oraya gider (iPhone ile aynı).
         targetListener = settings.onTargetChanged { server?.sendsToTv = settings.target == SubtitleTarget.TV }
         region = settings.region
-        extraAreas = settings.extraAreas.active()
+        extraAreas = settings.extraAreas.watched(settings.areaPreset)
         areasListener = settings.onAreasChanged {
             region = settings.region
-            extraAreas = settings.extraAreas.active()
+            extraAreas = settings.extraAreas.watched(settings.areaPreset)
         }
         try {
             subtitleServer.start()
@@ -322,7 +324,12 @@ class TranslationService : Service() {
         pipeline =SubtitlePipeline(translator, subtitleServer).apply {
             // Yarım ya da bozuk okuma hemen çevrilmez; aynı satırın en iyi okuması çevrilir (Windows ve iPhone ile aynı).
             holdReadings = true
-            packLookup = { text -> if (packTitles != null && settings.packsEnabled) PackLookup.match(library, text) else null }
+            packLookup = { text ->
+                if (packTitles != null && settings.packsEnabled) {
+                    library.setDisabled(settings.disabledPacks)
+                    PackLookup.match(library, text)
+                } else null
+            }
             showSpeakerNames = { settings.showSpeakerNames }
             onPackMissed = { text -> linePool.offer(text) }
             onPairShown = { pair ->
@@ -342,7 +349,12 @@ class TranslationService : Service() {
         val areaReader = SubtitleReader().also { regionReader = it }
         regionWatcher = com.couchsubs.mobile.core.RegionWatcher({ crop -> areaReader.read(crop.pixels as RegionPixels) },
             engineTranslator(free.separate()), subtitleServer).apply {
-            packLookup = { text -> if (packTitles != null && settings.packsEnabled) PackLookup.match(library, text) else null }
+            packLookup = { text ->
+                if (packTitles != null && settings.packsEnabled) {
+                    library.setDisabled(settings.disabledPacks)
+                    PackLookup.match(library, text)
+                } else null
+            }
         }
         background.scheduleWithFixedDelay({ linePool.flush() }, LinePool.FLUSH_INTERVAL_MS, LinePool.FLUSH_INTERVAL_MS, TimeUnit.MILLISECONDS)
         // Ücretsiz modelin ilk indirilmesi (yaklaşık 30 MB); oyun paketleri beklemeden çalışır.
@@ -352,7 +364,16 @@ class TranslationService : Service() {
             } catch (error: Exception) {
                 Log.w(TAG, "ML Kit model", error)
                 // Deneme modu model olmadan da hazır çeviriyle sürer; uyarı gösterilmez.
-                if (!demo) LiveState.update { it.copy(error = getString(R.string.error_model)) }
+                if (!demo) {
+                    val message = when (ModelDownloadRecovery.classify(error)) {
+                        ModelDownloadProblem.NETWORK -> R.string.error_model_network
+                        ModelDownloadProblem.STORAGE -> R.string.error_model_storage
+                        ModelDownloadProblem.UNAVAILABLE -> R.string.error_model_unavailable
+                        ModelDownloadProblem.TIMEOUT -> R.string.error_model_timeout
+                        ModelDownloadProblem.UNKNOWN -> R.string.error_model
+                    }
+                    LiveState.update { it.copy(error = getString(message)) }
+                }
             }
         }
 
@@ -372,7 +393,7 @@ class TranslationService : Service() {
             // Ek alanlar saniyede bir, kendi iş parçacığında okunur; altyazı okumasını beklemez, onu bekletmez.
             regionWatcher?.offer(extraAreas, { r ->
                 SubtitleReader.copyRegion(frame, r)?.let {
-                    com.couchsubs.mobile.core.RegionWatcher.Crop(it, com.couchsubs.mobile.core.RegionSignature.of(it.nv21, it.width, it.height))
+                    com.couchsubs.mobile.core.RegionWatcher.Crop(it, com.couchsubs.mobile.core.RegionSignature.of(it.nv21, it.width, it.height), it.gray)
                 }
             }) { task -> runCatching { regionWork.execute(task) } }
             FramePreview.offer(frame, now)
@@ -502,7 +523,8 @@ class TranslationService : Service() {
                 val reading = reader.read(pixels)
                 // Yapay zekâda ekranın bütün yazıları tek istekte gider (bkz. AiTranslator.translateAll).
                 val translator = engineTranslator(free.separate())
-                val items = ScreenTranslation.translate(reading, translator, { screenGeneration.get() != generation }) { shown ->
+                // Yazıların içindeki kumanda simgeleri okunan kareden kesilir (ButtonIcons).
+                val items = ScreenTranslation.translate(reading, translator, { screenGeneration.get() != generation }, pixels.gray) { shown ->
                     if (screenGeneration.get() != generation) return@translate
                     val milliseconds = ScreenTranslation.displayMilliseconds(shown)
                     server.sendScreen(shown, milliseconds)
@@ -612,7 +634,12 @@ class TranslationService : Service() {
             DisconnectKind.NETWORK -> getString(R.string.phase_network)
             DisconnectKind.REGISTRATION_INVALID -> getString(R.string.phase_registration_invalid)
             // Eskiden "Bağlantı koptu, yeniden bağlanılıyor…" görünüyordu, neden anlaşılmıyordu (GitHub #33, #202).
-            DisconnectKind.REJECTED -> state.detail?.let { getString(R.string.phase_rejected_code, it) } ?: getString(R.string.phase_rejected)
+            // 0x80108b12: PS5'te Uzaktan Oynatma kapalı (GitHub #9); genel "başka Remote Play açık olabilir" metni yanıltıyordu.
+            DisconnectKind.REJECTED -> when (state.detail) {
+                DisconnectKind.REMOTE_PLAY_DISABLED -> getString(R.string.phase_remote_play_disabled, state.detail)
+                null -> getString(R.string.phase_rejected)
+                else -> getString(R.string.phase_rejected_code, state.detail)
+            }
             DisconnectKind.NO_PICTURE -> getString(R.string.phase_no_picture)
             DisconnectKind.CONSOLE_ASLEEP -> getString(R.string.phase_asleep)
             DisconnectKind.LOGIN_PASSCODE -> getString(R.string.phase_passcode)
@@ -694,4 +721,16 @@ class TranslationService : Service() {
         LiveState.update { it.copy(running = false, phase = "", streaming = false, current = "", previous = "", regions = emptyList(), screen = emptyList(), screenState = LiveStatus.ScreenState.IDLE) }
         super.onDestroy()
     }
+}
+
+/**
+ * Bu kurulumun kalıcı kimliği (`/hello` yanıtında; Mac ve Windows'taki gibi): ilk istekte rastgele üretilir ve saklanır.
+ * TV uygulaması aynı ağdaki iki CouchSubs'tan kendisininkini bununla seçer (GitHub #425).
+ */
+private fun installationId(context: Context): String {
+    val prefs = context.getSharedPreferences("server", Context.MODE_PRIVATE)
+    prefs.getString("id", null)?.takeIf { it.isNotEmpty() }?.let { return it }
+    val made = java.util.UUID.randomUUID().toString()
+    prefs.edit().putString("id", made).apply()
+    return made
 }

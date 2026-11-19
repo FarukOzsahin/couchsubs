@@ -126,12 +126,20 @@ struct MainControls: View {
             SubtitleOutputCard()
             // Ayar bilgisi durum karosu gibi değil, satır olarak durur (TASARIM.md › InfoCard).
             InfoCard {
+                // Görüntünün nereden okunduğu; dokununca Ayarlar › Görüntü kaynağı (DM'de ayar bulunamıyordu).
+                InfoRow("Picture source", value: pictureSourceName, action: { model.openSettings(.source) })
+                InfoDivider()
                 InfoRow("Translation", value: engineName, action: { model.openSettings(.translation) })
                 InfoDivider()
                 InfoRow("Translate screen") { Keycap("⌥⌘T") }
             }
             MainWarnings()
         }
+    }
+
+    private var pictureSourceName: String {
+        model.settings.frameSource == .remotePlayWindow
+            ? String(localized: "Remote Play window on this Mac") : String(localized: "The PS5 (second account)")
     }
 
     private var engineName: String {
@@ -175,11 +183,15 @@ private struct TestSubtitleButton: View {
         Button {
             Task { await model.testSubtitle() }
         } label: {
-            Label(onTV ? "Test on TV" : "Test on screen", systemImage: onTV ? "tv" : "macwindow")
+            if model.openingTVAppForTest {
+                Label("Opening the app on the TV…", systemImage: "tv")
+            } else {
+                Label(onTV ? "Test on TV" : "Test on screen", systemImage: onTV ? "tv" : "macwindow")
+            }
         }
         .buttonStyle(CSButtonStyle(kind: .secondary, height: "primaryActionHeight"))
         .fixedSize()
-        .disabled(onTV && !model.hasTV && !model.settings.output.showsOnComputer)
+        .disabled((onTV && !model.hasTV && !model.settings.output.showsOnComputer) || model.openingTVAppForTest)
         .help(Text(onTV ? "Sends a sample subtitle to the TV." : "Shows a sample subtitle on this computer's screen."))
     }
 }
@@ -189,9 +201,20 @@ private struct TVStatusTile: View {
 
     var body: some View {
         if model.hasTV {
-            StatusTile(symbol: "tv", title: "TV",
-                       value: model.tvClients > 0 ? String(localized: "Connected") : String(localized: "Waiting for the TV app"),
-                       tone: AppModel.tvTone(clients: model.tvClients, running: model.isRunning))
+            if model.canReinstallTVApp {
+                // TV uygulaması bağlanmıyor (ör. TV'den kaldırıldı): TV adımı açılır, uygulama yeniden kurulur ya da açılır.
+                StatusTile(symbol: "tv", title: "TV", value: String(localized: "Waiting for the TV app"),
+                           tone: AppModel.tvTone(clients: model.tvClients, running: model.isRunning)) {
+                    Button("Reinstall the TV app") {
+                        model.step = .tv
+                        Task { await model.reinstallTVApp() }
+                    }.buttonStyle(.secondary)
+                }
+            } else {
+                StatusTile(symbol: "tv", title: "TV",
+                           value: model.tvClients > 0 ? String(localized: "Connected") : String(localized: "Waiting for the TV app"),
+                           tone: AppModel.tvTone(clients: model.tvClients, running: model.isRunning))
+            }
         } else {
             StatusTile(symbol: "tv", title: "TV", value: String(localized: "Not set up")) {
                 Button("Connect a TV") { model.step = .tv }.buttonStyle(.secondary)
@@ -247,7 +270,14 @@ private struct MainWarnings: View {
             }
         }
 
-        if let free = model.readingFailedFreeGB {
+        if model.readingStuck {
+            Card {
+                Label("macOS can't read the text on the screen.", systemImage: "exclamationmark.triangle")
+                    .font(.csBody.weight(.semibold))
+                    .foregroundStyle(Color.csWarning)
+                HintText(text: "Text reading got stuck. Quit CouchSubs (⌘Q), open it again and start the translation.")
+            }
+        } else if let free = model.readingFailedFreeGB {
             Card {
                 Label("macOS can't read the text on the screen.", systemImage: "exclamationmark.triangle")
                     .font(.csBody.weight(.semibold))

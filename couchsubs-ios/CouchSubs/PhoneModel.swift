@@ -141,6 +141,12 @@ final class PhoneModel: ObservableObject {
     /// PS5 bağlantısı kendiliğinden koptu (kullanıcı durdurmadı). Uygulama, etkin değilken yerel bildirim gösterir;
     /// testlerde boş.
     var onConnectionLost: () -> Void = {}
+    /// Çeviri sürerken uygulama arka plana geçti ya da ekran kilitlendi: iOS uygulamayı kısa süre sonra askıya alır ve
+    /// altyazı durur (Android'deki ön plan hizmetinin iOS'ta karşılığı yok). Uygulama gecikmeli bir yerel bildirim kurar;
+    /// `onResumedFromBackground` onu geri alır. Testlerde boş.
+    var onPausedInBackground: () -> Void = {}
+    /// Uygulama yeniden öne geldi: arka planda kurulan bildirim (henüz gösterilmediyse) iptal edilir, gösterildiyse silinir.
+    var onResumedFromBackground: () -> Void = {}
     /// PS5'te yeni bir oyun tanındı (paket sunucusuna o oyun için bakılır).
     var onGameStarted: () -> Void = {}
     /// Çeviri başlarken bildirim izni istenir (tercih açıksa; iOS yalnız ilk seferde sorar). Testlerde boş.
@@ -521,9 +527,18 @@ final class PhoneModel: ObservableObject {
     /// Arka plana gitmeden yalnız etkin olmaktan çıkıp dönünce (Denetim Merkezi, bildirim, izin penceresi) çalışan PS5
     /// oturumu kapatılıp açılmaz: eskiden her dönüşte kapatılıyor, PS5'te ikinci hesap girip çıkıyordu.
     func becameActive(afterBackground: Bool = true) {
+        if afterBackground { onResumedFromBackground() }
         guard isRunning else { return }
         if afterBackground || !Self.isLive(sessionState) { session?.reconnectNow() }
         keeper?.reconnect()
+    }
+
+    /// Uygulama arka plana geçti (ana ekran, başka uygulama ya da kilit tuşu). Çeviri sürüyorsa ve bildirim tercihi açıksa
+    /// kullanıcı uyarılır: iPhone'da altyazı yalnız CouchSubs ekranı açıkken sürer (iOS arka planda yerel ağ bağlantısını ve
+    /// görüntü okumayı durdurur). Deneme modunda PS5 yok, uyarı da yok.
+    func enteredBackground() {
+        guard isRunning, !demoMode, notifiesDisconnect else { return }
+        onPausedInBackground()
     }
 
     /// Bağlı ya da bağlanıyor; yeniden bağlanmaya gerek yok.
@@ -936,7 +951,7 @@ final class PhoneModel: ObservableObject {
         let server = self.server
         screenTask = Task { [weak self] in
             do {
-                let reading = try await Task.detached(priority: .userInitiated) { try reader.readLines(frame, deep: false) }.value
+                let reading = try await ReadQueue.shared.run { try reader.readLines(frame, deep: false) }
                 let items = try await ScreenTranslation.translate(reading, using: translator) { shown in
                     guard !Task.isCancelled else { return }
                     let milliseconds = ScreenTranslation.displayMilliseconds(shown)
@@ -1029,7 +1044,13 @@ final class PhoneModel: ObservableObject {
             case .noPicture: return String(localized: "No picture from the PS5. Is Remote Play turned off, or is the PS5 in rest mode? Check, then start again.")
             case .notFound(let host):
                 return String(format: String(localized: "PS5 not found at %@. Make sure it is on and on the same network. Reconnecting…"), host)
-            case .network: return String(localized: "Can't reach the PS5. Reconnecting…")
+            // Kablosuz ağda akış sık kopuyordu (GitHub #388, #401): yeniden bağlanılır, kalıcı çözüm kablodur.
+            case .network:
+                return String(localized: "Lost the connection to the PS5. Reconnecting… If this keeps happening, connect the PS5 to the router with a cable.")
+            // 0x80108b12: PS5'te Uzaktan Oynatma kapalı (GitHub #9). Ayar açılınca yeniden denemede bağlanılır.
+            case .rejected(.some(DisconnectReason.remotePlayDisabled)):
+                return String(format: String(localized: "Remote Play is turned off on the PS5 (code %@). On the PS5, go to Settings › System › Remote Play and turn on Enable Remote Play."),
+                              String(format: "0x%08x", DisconnectReason.remotePlayDisabled))
             // Eskiden "Yeniden bağlanılıyor…" ile anlamsız libchiaki metni (Unknown Session Request Error) vardı.
             case .rejected(let code?):
                 return String(format: String(localized: "The PS5 rejected the connection (code %@). Another Remote Play app (PS Remote Play) may be open, or the PS5 may be in another session. Close PS Remote Play, restart the PS5, then try again."), String(format: "0x%08x", code))

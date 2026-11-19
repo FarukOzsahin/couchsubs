@@ -113,6 +113,30 @@ public class SubtitleServerTests
                       new SubtitleEvent(SubtitleEventKind.RegionClear)], received);
     }
 
+    /// <summary>Ek alanın ayrı yazı grupları <c>blocks</c> ile kendi yerleriyle gider; birleşik <c>text</c> eski TV'ler için kalır.</summary>
+    [Fact]
+    public async Task StreamsRegionBlocksBesideTheJoinedText()
+    {
+        using var server = new SubtitleServer(0);
+        var port = await server.StartAsync();
+        using var response = await Http.GetAsync($"http://127.0.0.1:{port}/events", HttpCompletionOption.ResponseHeadersRead);
+        await WaitUntil(() => server.ConnectedClients == 1);
+        var box = new TextBox(0.6, 0.05, 0.95, 0.2);
+        server.SendRegion("q", "Find\nGo", box, 0.03, null,
+                          [new ScreenTranslation.Item("Find", "Find", new TextBox(0.7, 0.05, 0.95, 0.08), 0.03),
+                           new ScreenTranslation.Item("Go", "Go", new TextBox(0.6, 0.15, 0.7, 0.2), 0.04)]);
+        // Boşalan alanda blok gönderilmez.
+        server.SendRegion("q", "", null, null, null, [new ScreenTranslation.Item("Go", "Go", new TextBox(0.6, 0.15, 0.7, 0.2), 0.04)]);
+        server.ClearRegions();
+
+        using var reader = new StreamReader(await response.Content.ReadAsStreamAsync());
+        var lines = await ReadLines(reader, "event: region-clear");
+        Assert.Contains("data: {\"blocks\":[{\"box\":{\"bottom\":0.08,\"left\":0.7,\"right\":0.95,\"top\":0.05},\"line\":0.03,\"text\":\"Find\"}," +
+                        "{\"box\":{\"bottom\":0.2,\"left\":0.6,\"right\":0.7,\"top\":0.15},\"line\":0.04,\"text\":\"Go\"}]," +
+                        "\"box\":{\"bottom\":0.2,\"left\":0.6,\"right\":0.95,\"top\":0.05},\"id\":\"q\",\"line\":0.03,\"text\":\"Find\\nGo\"}", lines);
+        Assert.Contains("data: {\"id\":\"q\",\"text\":\"\"}", lines);
+    }
+
     [Fact]
     public async Task ObsOverlayIsServedAndNotCountedAsTv()
     {
@@ -233,7 +257,7 @@ public class SubtitleServerTests
     public void OldSavedStyleGetsNewDefaults()
     {
         var style = System.Text.Json.JsonSerializer.Deserialize<SubtitleStyle>("{\"FontSize\":58,\"BottomPercent\":12}");
-        Assert.Equal(new SubtitleStyle(58, 12, SubtitlePlacement.Cover, 72, false), style);
+        Assert.Equal(new SubtitleStyle(58, 12, SubtitlePlacement.Cover, 90, false), style);
         var again = System.Text.Json.JsonSerializer.Deserialize<SubtitleStyle>(System.Text.Json.JsonSerializer.Serialize(style! with { Placement = SubtitlePlacement.Below }));
         Assert.Equal(SubtitlePlacement.Below, again!.Placement);
     }
@@ -252,10 +276,36 @@ public class SubtitleServerTests
     [Fact]
     public async Task HelloIdentifiesTheApp()
     {
+        using var server = new SubtitleServer(0) { InstanceId = "3f2a-b9" };
+        var port = await server.StartAsync();
+        using var http = new HttpClient();
+        Assert.Equal("{\"app\":\"couchsubs\",\"id\":\"3f2a-b9\",\"tvs\":0}", await http.GetStringAsync($"http://127.0.0.1:{port}/hello"));
+    }
+
+    /// <summary>Kurulum kimliği kalıcıdır: aynı ağdaki iki CouchSubs'ı TV bununla ayırır (GitHub #425).</summary>
+    [Fact]
+    public void InstallationIdIsStable()
+    {
+        using var first = new SubtitleServer(0);
+        using var second = new SubtitleServer(0);
+        Assert.False(string.IsNullOrEmpty(first.InstanceId));
+        Assert.Equal(first.InstanceId, second.InstanceId);
+        Assert.Equal("{\"app\":\"couchsubs\",\"id\":\"ab\",\"tvs\":2}", SubtitleServer.HelloBody("a\"b", 2));
+    }
+
+    // Yeni tarayıcılı TV'ler (Tizen 9.0) yerel ağdaki sunucuya ön istekte izin başlığı ister.
+    [Fact]
+    public async Task PreflightAllowsPrivateNetworkAccess()
+    {
         using var server = new SubtitleServer(0);
         var port = await server.StartAsync();
         using var http = new HttpClient();
-        Assert.Equal("{\"app\":\"couchsubs\"}", await http.GetStringAsync($"http://127.0.0.1:{port}/hello"));
+        using var request = new HttpRequestMessage(HttpMethod.Options, $"http://127.0.0.1:{port}/events");
+        request.Headers.Add("Access-Control-Request-Private-Network", "true");
+        using var response = await http.SendAsync(request);
+        Assert.Equal(System.Net.HttpStatusCode.NoContent, response.StatusCode);
+        Assert.Equal("true", Assert.Single(response.Headers.GetValues("Access-Control-Allow-Private-Network")));
+        Assert.Equal("*", Assert.Single(response.Headers.GetValues("Access-Control-Allow-Origin")));
     }
 
     [Fact]

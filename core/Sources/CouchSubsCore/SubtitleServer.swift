@@ -56,7 +56,7 @@ public struct SubtitleStyle: Codable, Equatable, Sendable {
     /// yerine geçer. TV uygulaması 0.9.16 ve sonrası tanır (Windows: SubtitleStyle.StackPrevious).
     public var stackPrevious: Bool
 
-    public init(fontSize: Int = 46, bottomPercent: Int = 7, placement: SubtitlePlacement = .cover, background: Int = 72, backgroundShape: SubtitleBackgroundShape = .fit, bold: Bool = false,
+    public init(fontSize: Int = 46, bottomPercent: Int = 7, placement: SubtitlePlacement = .cover, background: Int = 90, backgroundShape: SubtitleBackgroundShape = .fit, bold: Bool = false,
                 textColor: SubtitleTextColor = .white, displayMode: TVDisplayMode = .inApp, stackPrevious: Bool = true) {
         self.fontSize = fontSize
         self.bottomPercent = bottomPercent
@@ -145,9 +145,30 @@ public final class SubtitleServer: @unchecked Sendable {
     static let pingFrame = ": ping\n\nevent: ping\ndata: {}\n\n"
     private let pingInterval: TimeInterval
 
-    public init(port: UInt16 = 8787, pingInterval: TimeInterval = 15) {
+    /// Bu kurulumun kalıcı kimliği (`/hello` yanıtında). Aynı ağda iki CouchSubs varken TV uygulaması kendi bilgisayarını
+    /// ya da telefonunu adres değişse de bununla tanır; eskiden ağda ilk bulduğuna bağlanıyordu (GitHub #425).
+    public let instanceId: String
+
+    public init(port: UInt16 = 8787, pingInterval: TimeInterval = 15, instanceId: String = SubtitleServer.installationId) {
         requestedPort = port
         self.pingInterval = pingInterval
+        self.instanceId = instanceId
+    }
+
+    /// Kurulumun kimliği: ilk istekte rastgele üretilir ve ayarlarda saklanır (Mac ve iPhone).
+    public static var installationId: String {
+        let key = "couchsubs.serverId"
+        if let saved = UserDefaults.standard.string(forKey: key), !saved.isEmpty { return saved }
+        let made = UUID().uuidString.lowercased()
+        UserDefaults.standard.set(made, forKey: key)
+        return made
+    }
+
+    /// `/hello` yanıtı: uygulama, kurulum kimliği ve bağlı TV sayısı (Windows ve Android ile aynı biçim). TV, ağda birden
+    /// çok CouchSubs bulursa kayıtlı kimliği, yoksa TV'si bağlı olmayanı seçer.
+    static func helloBody(id: String, tvs: Int) -> String {
+        let escaped = id.filter { $0.isLetter || $0.isNumber || $0 == "-" }
+        return #"{"app":"couchsubs","id":""# + escaped + #"","tvs":"# + String(max(0, tvs)) + "}"
     }
 
     public var connectedClients: Int {
@@ -231,6 +252,19 @@ public final class SubtitleServer: @unchecked Sendable {
         return ["left": round(box.left), "top": round(box.top), "right": round(box.right), "bottom": round(box.bottom)]
     }
 
+    /// Yeriyle bir çeviri ("Ekranı çevir" öğesi ya da ek alan bloğu).
+    static func json(_ item: ScreenTranslation.Item) -> [String: Any] {
+        let line = Decimal(Int((max(0, min(1, item.lineHeight)) * 10000).rounded())) / 10000
+        var result: [String: Any] = ["box": Self.json(item.box), "line": line, "text": item.translation]
+        if item.paragraphs { result["paragraphs"] = true }
+        if let icons = item.icons, !icons.isEmpty { result["icons"] = Self.json(icons) }
+        return result
+    }
+
+    static func json(_ icons: [IconPlacement]) -> [[String: Any]] {
+        icons.map { icon -> [String: Any] in ["at": icon.at, "src": icon.image] }
+    }
+
     public func clear() {
         broadcast(event: "clear", json: [:])
         onEvent?(.clear)
@@ -258,15 +292,11 @@ public final class SubtitleServer: @unchecked Sendable {
     }
 
     /// "Ekranı çevir" sonuçları: `screen` olayı her çeviriyi yazının yeri (`box`), tipik satır yüksekliği (`line`,
-    /// ekrana oranla) ve çok parçalıysa `paragraphs` ile taşır. TV öncekinin yerine bunları koyar.
+    /// ekrana oranla) ve çok parçalıysa `paragraphs` ile taşır. TV öncekinin yerine bunları koyar. Çevirinin içinde
+    /// kumanda simgeleri varsa `icons` her simgenin düz metindeki yerini (`at`) ve PNG'sini (`src`) taşır; eski TV
+    /// uygulamaları alanı yok sayıp düz metni gösterir (Windows ile aynı).
     public func sendScreen(_ items: [ScreenTranslation.Item], durationMs: Int) {
-        let round = { (value: Double) in Decimal(Int((max(0, min(1, value)) * 10000).rounded())) / 10000 }
-        let list: [[String: Any]] = items.map { item in
-            var json: [String: Any] = ["box": Self.json(item.box), "line": round(item.lineHeight), "text": item.translation]
-            if item.paragraphs { json["paragraphs"] = true }
-            return json
-        }
-        broadcast(event: "screen", json: ["duration": durationMs, "items": list])
+        broadcast(event: "screen", json: ["duration": durationMs, "items": items.map { Self.json($0) }])
         // Altyazı yalnız bilgisayardaysa (TV yok) çeviriler başka hiçbir yere gitmiyordu: tuşa basınca yalnız
         // "Ekran çevriliyor…" görünüyordu.
         onEvent?(.screen(text: items.map(\.translation).joined(separator: "\n"), durationMs: durationMs))
@@ -276,7 +306,23 @@ public final class SubtitleServer: @unchecked Sendable {
     /// yerini (`box`) ve satır yüksekliğini (`line`, ekrana oranla) taşır. TV çeviriyi o yerde küçük bir kutuda gösterir;
     /// ana altyazıya dokunmaz. Olayı tanımayan eski TV uygulamaları yok sayar.
     public func sendRegion(id: String, text: String, box: TextBox?, lineHeight: Double? = nil) {
+        sendRegion(id: id, text: text, box: box, lineHeight: lineHeight, icons: nil)
+    }
+
+    /// `icons`: çevirinin içindeki kumanda simgeleri; `icons` alanı her simgenin düz metindeki yerini (`at`) ve PNG'sini
+    /// (`src`) taşır. Eski TV uygulamaları alanı yok sayıp düz metni gösterir.
+    public func sendRegion(id: String, text: String, box: TextBox?, lineHeight: Double?, icons: [IconPlacement]?) {
+        sendRegion(id: id, text: text, box: box, lineHeight: lineHeight, icons: icons, blocks: nil)
+    }
+
+    /// `blocks`: alanda ayrı duran yazı gruplarının çevirileri kendi yerleriyle (`blocks`; her biri `screen` olayındaki
+    /// öğe gibi `box`, `line`, `text`). TV her birini kendi İngilizce yazısının üstüne koyar. Alanı tanımayan eski TV
+    /// uygulamaları birleşik `text`'i tek kutuda gösterir (Windows ile aynı).
+    public func sendRegion(id: String, text: String, box: TextBox?, lineHeight: Double?, icons: [IconPlacement]?,
+                           blocks: [ScreenTranslation.Item]?) {
         var json: [String: Any] = ["id": id, "text": text]
+        if let icons, !icons.isEmpty { json["icons"] = Self.json(icons) }
+        if let blocks, !blocks.isEmpty, !text.isEmpty { json["blocks"] = blocks.map { Self.json($0) } }
         if let box { json["box"] = Self.json(box) }
         if let lineHeight { json["line"] = Decimal(Int((max(0, min(1, lineHeight)) * 10000).rounded())) / 10000 }
         broadcast(event: "region", json: json)
@@ -353,14 +399,16 @@ public final class SubtitleServer: @unchecked Sendable {
         let method = parts.first.map(String.init) ?? ""
 
         if method == "OPTIONS" {
-            respondAndClose(connection, status: "204 No Content")
+            // Chromium'un yerel ağ erişimi denetimi (Private Network Access) ön istekte bu başlıkları ister; yeni
+            // tarayıcılı TV'ler (Tizen 9.0 ve sonrası) başlık olmadan bilgisayara bağlanmayabilir. Eski TV'ler yok sayar.
+            respondAndClose(connection, status: "204 No Content", data: Data(), type: nil, extraHeaders: Self.preflightHeaders)
         } else if method == "GET" && path == "/events" {
             openStream(connection, viewer: target.contains("viewer=obs"))
         } else if method == "GET" && path == "/obs" {
             respondAndClose(connection, status: "200 OK", data: Self.obsOverlay, type: "text/html; charset=utf-8")
         } else if method == "GET" && path == "/hello" {
-            // TV uygulaması ağdaki bilgisayarı bu yanıtla tanır.
-            respondAndClose(connection, status: "200 OK", body: #"{"app":"couchsubs"}"#)
+            // TV uygulaması ağdaki bilgisayarı bu yanıtla tanır (bağlantı kuyruğunda: sayaçlar doğrudan okunur).
+            respondAndClose(connection, status: "200 OK", body: Self.helloBody(id: instanceId, tvs: clients.count - viewers.count))
         } else if method == "GET", let file = files[path] {
             respondAndClose(connection, status: "200 OK", data: file.data, type: file.type)
         } else {
@@ -372,8 +420,11 @@ public final class SubtitleServer: @unchecked Sendable {
         respondAndClose(connection, status: status, data: Data(body.utf8), type: nil)
     }
 
-    private func respondAndClose(_ connection: NWConnection, status: String, data: Data, type: String?) {
-        var head = "HTTP/1.1 \(status)\r\nAccess-Control-Allow-Origin: *\r\n"
+    static let preflightHeaders = "Access-Control-Allow-Methods: GET, OPTIONS\r\nAccess-Control-Allow-Headers: *\r\n"
+        + "Access-Control-Allow-Private-Network: true\r\nAccess-Control-Max-Age: 600\r\n"
+
+    private func respondAndClose(_ connection: NWConnection, status: String, data: Data, type: String?, extraHeaders: String = "") {
+        var head = "HTTP/1.1 \(status)\r\nAccess-Control-Allow-Origin: *\r\n" + extraHeaders
         if let type { head += "Content-Type: \(type)\r\nCache-Control: no-cache\r\n" }
         head += "Content-Length: \(data.count)\r\nConnection: close\r\n\r\n"
         connection.send(content: Data(head.utf8) + data, completion: .contentProcessed { _ in connection.cancel() })

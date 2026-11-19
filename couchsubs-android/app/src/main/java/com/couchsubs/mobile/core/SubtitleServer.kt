@@ -30,7 +30,7 @@ data class SubtitleStyle(
     val fontSize: Int = 46,
     val bottomPercent: Int = 7,
     val placement: SubtitlePlacement = SubtitlePlacement.COVER,
-    val background: Int = 72,
+    val background: Int = 90,
     val backgroundShape: SubtitleBackgroundShape = SubtitleBackgroundShape.FIT,
     val bold: Boolean = false,
     val textColor: SubtitleTextColor = SubtitleTextColor.WHITE,
@@ -74,9 +74,18 @@ class SubtitleServer(
     private val port: Int = DEFAULT_PORT,
     private val pingIntervalMs: Long = 15_000,
     private val clock: () -> Long = System::currentTimeMillis,
+    /**
+     * Bu kurulumun kalıcı kimliği (`/hello` yanıtında). Aynı ağda iki CouchSubs varken TV uygulaması kendi telefonunu ya da
+     * bilgisayarını adres değişse de bununla tanır; eskiden ağda ilk bulduğuna bağlanıyordu (GitHub #425).
+     */
+    val instanceId: String = "",
 ) : SubtitleSender, RegionSender {
     companion object {
         const val DEFAULT_PORT = 8787
+
+        /** `/hello` yanıtı: uygulama, kurulum kimliği ve bağlı TV sayısı (Mac ve Windows ile aynı biçim). */
+        fun helloBody(id: String, tvs: Int): String =
+            "{\"app\":\"couchsubs\",\"id\":\"${id.filter { it.isLetterOrDigit() && it.code < 128 || it == '-' }}\",\"tvs\":${maxOf(0, tvs)}}"
 
         /** Bağlantı canlı tutma: yorum satırını EventSource görmez; adlı "ping" olayını TV görür. */
         const val PING_FRAME = ": ping\n\nevent: ping\ndata: {}\n\n"
@@ -102,8 +111,14 @@ class SubtitleServer(
          * Ek alanın çevirisi: alanın kimliği (`id`), çeviri (`text`; boşsa kutu kalkar), yazının karedeki yeri (`box`) ve
          * satır yüksekliği (`line`, ekrana oranla). TV çeviriyi o yerde küçük bir kutuda gösterir (Mac/iPhone ile aynı).
          */
-        fun regionFrame(id: String, text: String, box: TextBox?, lineHeight: Double?): String {
+        fun regionFrame(
+            id: String, text: String, box: TextBox?, lineHeight: Double?, icons: List<IconPlacement>? = null,
+            blocks: List<ScreenTranslation.Item>? = null,
+        ): String {
             val json = mutableMapOf<String, Any?>("id" to id, "text" to text)
+            if (!icons.isNullOrEmpty()) json["icons"] = iconsJson(icons)
+            // Alanda ayrı duran yazı gruplarının çevirileri kendi yerleriyle; eski TV uygulamaları birleşik `text`'i gösterir.
+            if (!blocks.isNullOrEmpty() && text.isNotEmpty()) json["blocks"] = blocks.map { itemJson(it) }
             if (box != null) json["box"] = boxJson(box)
             if (lineHeight != null) json["line"] = Json.Decimal(Math.round(lineHeight.coerceIn(0.0, 1.0) * 10000) / 10000.0)
             return frame("region", json)
@@ -114,16 +129,22 @@ class SubtitleServer(
          * çok parçalıysa `paragraphs` ile gider (Mac/iPhone `screen` olayı ile aynı). TV öncekinin yerine bunları koyar.
          */
         fun screenFrame(items: List<ScreenTranslation.Item>, durationMs: Int): String {
-            val list = items.map { item ->
-                val json = mutableMapOf<String, Any?>(
-                    "box" to boxJson(item.box), "line" to Json.Decimal(Math.round(item.lineHeight.coerceIn(0.0, 1.0) * 10000) / 10000.0),
-                    "text" to item.translation,
-                )
-                if (item.paragraphs) json["paragraphs"] = true
-                json
-            }
-            return frame("screen", mapOf("duration" to durationMs, "items" to list))
+            return frame("screen", mapOf("duration" to durationMs, "items" to items.map { itemJson(it) }))
         }
+
+        /** Yeriyle bir çeviri ("Ekranı çevir" öğesi ya da ek alan bloğu). */
+        private fun itemJson(item: ScreenTranslation.Item): Map<String, Any?> {
+            val json = mutableMapOf<String, Any?>(
+                "box" to boxJson(item.box), "line" to Json.Decimal(Math.round(item.lineHeight.coerceIn(0.0, 1.0) * 10000) / 10000.0),
+                "text" to item.translation,
+            )
+            if (item.paragraphs) json["paragraphs"] = true
+            item.icons?.takeIf { it.isNotEmpty() }?.let { json["icons"] = iconsJson(it) }
+            return json
+        }
+
+        /** Çevirinin içindeki kumanda simgeleri: düz metindeki yeri (`at`) ve PNG'si (`src`); eski TV uygulamaları yok sayar. */
+        fun iconsJson(icons: List<IconPlacement>) = icons.map { mapOf("at" to it.at, "src" to it.image) }
 
         fun styleFrame(style: SubtitleStyle) = frame(
             "style", mapOf(
@@ -196,8 +217,18 @@ class SubtitleServer(
         onEvent?.invoke(SubtitleEvent.Cleared)
     }
 
-    override fun sendRegion(id: String, text: String, box: TextBox?, lineHeight: Double?) {
-        broadcast(regionFrame(id, text, box, lineHeight), subtitle = true)
+    override fun sendRegion(id: String, text: String, box: TextBox?, lineHeight: Double?) = sendRegion(id, text, box, lineHeight, null)
+
+    /** [icons]: çevirinin içindeki kumanda simgeleri ([ButtonIcons]); `icons` alanıyla gider. */
+    override fun sendRegion(id: String, text: String, box: TextBox?, lineHeight: Double?, icons: List<IconPlacement>?) =
+        sendRegion(id, text, box, lineHeight, icons, null)
+
+    /** [blocks]: alanda ayrı duran yazı gruplarının çevirileri kendi yerleriyle (`blocks`). */
+    override fun sendRegion(
+        id: String, text: String, box: TextBox?, lineHeight: Double?, icons: List<IconPlacement>?,
+        blocks: List<ScreenTranslation.Item>?,
+    ) {
+        broadcast(regionFrame(id, text, box, lineHeight, icons, blocks), subtitle = true)
         onEvent?.invoke(SubtitleEvent.Region(id, text, box))
     }
 
@@ -248,7 +279,7 @@ class SubtitleServer(
                 method == "OPTIONS" -> respondAndClose(socket, "204 No Content")
                 method == "GET" && path == "/events" -> openStream(socket, target.contains("viewer=obs"))
                 // TV uygulaması ağdaki CouchSubs'ı bu yanıtla tanır.
-                method == "GET" && path == "/hello" -> respondAndClose(socket, "200 OK", "{\"app\":\"couchsubs\"}")
+                method == "GET" && path == "/hello" -> respondAndClose(socket, "200 OK", helloBody(instanceId, connectedClients))
                 else -> respondAndClose(socket, "404 Not Found")
             }
         } catch (error: IOException) {

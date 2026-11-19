@@ -62,6 +62,39 @@ final class ReconnectPolicyTests: XCTestCase {
     }
 }
 
+/// Kablosuz ağda akış sık kopuyordu (GitHub #388, #401): on dakikada iki kopmadan sonra 720p istenir.
+final class QualityFallbackTests: XCTestCase {
+    private let start = Date(timeIntervalSince1970: 0)
+
+    func testTwoDropsWithinWindowLowerTo720p() {
+        var quality = QualityFallback()
+        XCTAssertFalse(quality.dropped(at: start))
+        XCTAssertFalse(quality.lowered)
+        XCTAssertTrue(quality.dropped(at: start.addingTimeInterval(120)))
+        XCTAssertTrue(quality.lowered)
+        // Bir kez düşürülür; sonraki kopmalar yeniden bildirmez.
+        XCTAssertFalse(quality.dropped(at: start.addingTimeInterval(130)))
+        XCTAssertTrue(quality.lowered)
+    }
+
+    func testDropsFarApartKeep1080p() {
+        var quality = QualityFallback()
+        XCTAssertFalse(quality.dropped(at: start))
+        XCTAssertFalse(quality.dropped(at: start.addingTimeInterval(QualityFallback.window + 1)))
+        XCTAssertFalse(quality.dropped(at: start.addingTimeInterval(2 * QualityFallback.window + 2)))
+        XCTAssertFalse(quality.lowered)
+    }
+
+    func testOnlyNetworkLikeDropsCount() {
+        XCTAssertTrue(QualityFallback.countsAsDrop(.network))
+        XCTAssertTrue(QualityFallback.countsAsDrop(.other(PictureWatchdog.reason)))
+        XCTAssertFalse(QualityFallback.countsAsDrop(.inUse))
+        XCTAssertFalse(QualityFallback.countsAsDrop(.rejected(0x80108bff)))
+        XCTAssertFalse(QualityFallback.countsAsDrop(.registrationInvalid))
+        XCTAssertFalse(QualityFallback.countsAsDrop(.stopped))
+    }
+}
+
 final class PictureWatchdogTests: XCTestCase {
     private let start = Date(timeIntervalSince1970: 0)
 
@@ -270,6 +303,12 @@ final class DisconnectReasonTests: XCTestCase {
                        .registrationInvalid)
         XCTAssertEqual(DisconnectReason.sessionRequestHint(fromLog: "Reported Application Reason: 0x80108bff (unknown)"),
                        .rejected(0x80108bff))
+        // PS5 bu cihazın kayıt anahtarını eşli cihazlarında bulamadı: yeniden eşlenmeli (sonsuz yeniden deneme yok).
+        XCTAssertEqual(DisconnectReason.sessionRequestHint(fromLog: "Reported Application Reason: 0x80108b26 (unknown)"),
+                       .registrationInvalid)
+        // PS5'te Uzaktan Oynatma kapalı (GitHub #9): kod korunur, ekranda ayarın yolu gösterilir.
+        XCTAssertEqual(DisconnectReason.sessionRequestHint(fromLog: "Reported Application Reason: 0x80108b12 (unknown)"),
+                       .rejected(DisconnectReason.remotePlayDisabled))
         XCTAssertNil(DisconnectReason.sessionRequestHint(fromLog: "Reported Application Reason: garbage"))
         XCTAssertEqual(DisconnectReason.sessionRequestHint(fromLog: "Session request connect failed eventually."), .network)
         XCTAssertEqual(DisconnectReason.sessionRequestHint(fromLog: "Failed to receive session request response"), .network)
@@ -305,10 +344,20 @@ final class DisconnectReasonTests: XCTestCase {
     func testMovedConsoleIsPickedOnlyWhenCertain() {
         let a = ConsoleInfo(host: "192.168.1.20", name: "PS5-A", isAwake: true)
         let b = ConsoleInfo(host: "192.168.1.21", name: "PS5-B", isAwake: true)
-        XCTAssertEqual(StreamSession.pickMoved([a], name: "other"), a)
+        // Ağda tek PS5 olsa bile adı tutmuyorsa başka evin/odanın PS5'idir (GitHub #425).
+        XCTAssertNil(StreamSession.pickMoved([a], name: "other"))
+        XCTAssertEqual(StreamSession.pickMoved([a], name: "PS5-A"), a)
         XCTAssertEqual(StreamSession.pickMoved([a, b], name: "PS5-B"), b)
         XCTAssertNil(StreamSession.pickMoved([a, b], name: "other"))
         XCTAssertNil(StreamSession.pickMoved([], name: "PS5-A"))
+    }
+
+    /// Kayıtlı adreste başka PS5 yanıt verirse kayıtlı PS5 sayılmaz (GitHub #425).
+    func testOtherConsoleAtSavedAddressIsNotTheRegisteredOne() {
+        let a = ConsoleInfo(host: "192.168.1.20", name: "PS5-A", isAwake: true)
+        XCTAssertTrue(StreamSession.isRegistered(a, name: "PS5-A"))
+        XCTAssertFalse(StreamSession.isRegistered(a, name: "PS5-B"))
+        XCTAssertTrue(StreamSession.isRegistered(a, name: ""))
     }
 }
 
@@ -337,5 +386,27 @@ final class LoginPasscodeTests: XCTestCase {
     /// PS5 şifreyi yeniden istiyorsa önceki yanlıştı: aynı şifre tekrar gönderilmez.
     func testIncorrectPasscodeIsNotResent() {
         XCTAssertEqual(LoginPasscode.reply(saved: "1234", incorrect: true), .stop(.loginPasscodeIncorrect))
+    }
+}
+
+/// Kullanıcı PS5'i kapatınca (dinlenme modu) yeniden bağlanma döngüsü PS5'i yeniden açmamalı; eskiden açıyordu ve ana
+/// ekran PS5 kapatılmış görünürken "PS5 bağlı" diyordu.
+final class WakePolicyTests: XCTestCase {
+    func testWakesOnlyBeforeFirstConnection() {
+        var policy = WakePolicy()
+        XCTAssertEqual(policy.action(awake: false), .wake)
+        XCTAssertEqual(policy.action(awake: true), .connect)
+        XCTAssertEqual(policy.action(awake: nil), .connect)
+        policy.streamed()
+        XCTAssertEqual(policy.action(awake: false), .waitUntilOn)
+        XCTAssertEqual(policy.action(awake: true), .connect)
+        XCTAssertEqual(policy.action(awake: nil), .connect)
+    }
+
+    func testNewStartWakesAgain() {
+        var policy = WakePolicy()
+        policy.streamed()
+        policy.reset()
+        XCTAssertEqual(policy.action(awake: false), .wake)
     }
 }

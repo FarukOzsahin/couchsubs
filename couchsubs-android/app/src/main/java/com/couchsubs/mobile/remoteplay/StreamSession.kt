@@ -16,8 +16,8 @@ enum class DisconnectKind {
     /** PS5 Ayarlar'daki giriş şifresini kabul etmedi; yeniden gönderilmez. */
     LOGIN_PASSCODE_INCORRECT,
     /**
-     * PS5 oturum isteğinde kaydı kabul etmedi (0x80108b09 kayıt geçersiz, 0x80108b02 hesap tanınmıyor). Yeniden denemek
-     * aynı yere çıkar; PS5 ikinci hesapla yeniden eşlenmelidir.
+     * PS5 oturum isteğinde kaydı kabul etmedi (0x80108b09 kayıt geçersiz, 0x80108b02 hesap tanınmıyor, 0x80108b26 PS5 bu
+     * cihazın eşlemesini bulamadı). Yeniden denemek aynı yere çıkar; PS5 ikinci hesapla yeniden eşlenmelidir.
      */
     REGISTRATION_INVALID,
     /**
@@ -34,8 +34,19 @@ enum class DisconnectKind {
     OTHER;
 
     companion object {
-        /** CHIAKI_RP_APPLICATION_REASON_REGIST_FAILED ve _INVALID_PSN_ID. */
-        val REGISTRATION_REJECTED_CODES = setOf(0x80108b09L, 0x80108b02L)
+        /**
+         * CHIAKI_RP_APPLICATION_REASON_REGIST_FAILED, _INVALID_PSN_ID ve 0x80108b26. 0x80108b26'yı libchiaki tanımaz: PS5
+         * gönderilen kayıt anahtarını (RP-Registkey) kendi eşli cihaz listesinde bulamadı (eşleme PS5'te silinmiş ya da PS5
+         * sıfırlanmış). Yeniden denemek aynı yere çıkar; PS5 yeniden eşlenmelidir.
+         */
+        val REGISTRATION_REJECTED_CODES = setOf(0x80108b09L, 0x80108b02L, 0x80108b26L)
+
+        /**
+         * PS5'te Uzaktan Oynatma kapalı (Ayarlar › Sistem › Uzaktan Oynatma › Uzaktan Oynatmayı Etkinleştir); [REJECTED]
+         * ayrıntısında bu yazımla gelir. libchiaki tanımaz; GitHub #9'da kullanıcı ayarı açınca düzeldi. Ayar açılınca
+         * bağlanılsın diye yeniden denenir.
+         */
+        const val REMOTE_PLAY_DISABLED = "0x80108b12"
         private val unreachableLines = listOf(
             "Session request connect failed eventually",
             "Failed to send session request",
@@ -102,16 +113,113 @@ sealed class SessionState {
     data class Disconnected(val kind: DisconnectKind, val detail: String? = null) : SessionState()
 }
 
-/** Bağlantı koptuğunda yeniden deneme aralıkları: 2, 4, 8, 16, en çok 30 sn (Windows ile aynı). */
+/**
+ * Bağlantı koptuğunda yeniden deneme aralıkları: 2, 4, 8, 16, en çok 30 sn (Mac/iPhone ve Windows ile aynı). Aralık
+ * bağlanınca hemen değil, oturum [STABLE_AFTER_MS] kadar sürdükten sonra kapanınca baştan başlar. Eskiden her bağlanışta
+ * sıfırlanıyordu: PS5 oturumu açılıp birkaç saniyede düşürünce 2 sn sonra yeniden bağlanılıyor, PS5'te ikinci hesap
+ * durmadan girip çıkıyordu.
+ */
 class ReconnectPolicy {
+    companion object {
+        const val STABLE_AFTER_MS = 60_000L
+    }
+
     private var attempt = 0
-    fun nextDelaySeconds(): Int {
+    private var connectedAt: Long? = null
+
+    /** [inUse]: Uzaktan Oynatma başka cihazda; sık denemek boşuna, en az 8 sn beklenir (8, 16, 30). */
+    fun nextDelaySeconds(inUse: Boolean = false): Int {
+        if (inUse) attempt = maxOf(attempt, 2)
         val delay = minOf(30, 2 shl attempt)
         attempt = minOf(attempt + 1, 5)
         return delay
     }
+
     fun reset() {
         attempt = 0
+        connectedAt = null
+    }
+
+    fun connected(nowMs: Long) {
+        connectedAt = nowMs
+    }
+
+    /** Oturum kapandı: uzun sürdüyse aralık baştan başlar, kısa sürdüyse büyümeye devam eder. */
+    fun ended(nowMs: Long) {
+        val at = connectedAt
+        if (at != null && nowMs - at >= STABLE_AFTER_MS) attempt = 0
+        connectedAt = null
+    }
+}
+
+/**
+ * Dinlenme modundaki PS5 uyandırılsın mı (Mac/iPhone ve Windows'taki WakePolicy ile aynı kural). Yalnız kullanıcı çeviriyi
+ * başlattıktan sonra, PS5'e henüz bağlanılmamışken uyandırılır. Eskiden yeniden bağlanma döngüsü de uyandırıyordu: oyuncu
+ * PS5'i kapatınca (dinlenme modu) uygulama birkaç saniye sonra PS5'i yeniden açıp bağlanıyor, TV kapalıyken ana ekran
+ * "PS5 bağlı" diyordu. Bu çeviride akış bir kez kurulduysa dinlenmedeki PS5'e dokunulmaz; açılınca bağlanılır.
+ */
+class WakePolicy {
+    enum class Action {
+        /** PS5 uyanık ya da aramaya yanıt vermedi: oturum açılmaya çalışılır. */
+        CONNECT,
+        /** PS5 dinlenmede, çeviri yeni başladı: uyandırılır. */
+        WAKE,
+        /** PS5 dinlenmede ve bu çeviride zaten bağlanılmıştı (kullanıcı kapattı): açılması beklenir. */
+        WAIT_UNTIL_ON,
+    }
+
+    private var hasStreamed = false
+
+    /** Kullanıcı çeviriyi başlattı. */
+    fun reset() {
+        hasStreamed = false
+    }
+
+    /** PS5'e bağlanıldı. */
+    fun streamed() {
+        hasStreamed = true
+    }
+
+    /** [awake]: aramada PS5'in durumu (null: yanıt vermedi). */
+    fun action(awake: Boolean?): Action = when {
+        awake != false -> Action.CONNECT
+        hasStreamed -> Action.WAIT_UNTIL_ON
+        else -> Action.WAKE
+    }
+}
+
+/**
+ * Bağlantı sık kopuyorsa görüntü 720p'ye düşürülür (Mac/iPhone ve Windows'taki QualityFallback ile aynı kural). 1080p akış
+ * ~15 Mbit/sn, 720p ~10 Mbit/sn ister. Kablosuz ağda PS5 akışı birkaç dakikada bir kopuyor ya da görüntü takılıyordu
+ * (GitHub #388, #401); altyazı okumak için 720p yeterlidir. [WINDOW_MS] içinde [DROPS_TO_LOWER] kopma olursa bu çeviri
+ * boyunca 720p kullanılır.
+ */
+class QualityFallback {
+    companion object {
+        const val WINDOW_MS = 10 * 60_000L
+        const val DROPS_TO_LOWER = 2
+
+        /**
+         * Kopma ağ kaynaklı mı (akış sürerken PS5 ile bağlantı gitti ya da görüntü kesildi). PS5'in reddi, başka cihazda
+         * kullanım ya da durdurma sayılmaz: düşük çözünürlük bunlara çare değildir.
+         */
+        fun countsAsDrop(kind: DisconnectKind) = kind == DisconnectKind.NETWORK || kind == DisconnectKind.OTHER
+    }
+
+    private val drops = ArrayDeque<Long>()
+
+    /** Görüntü 720p'ye düşürüldü mü. */
+    var lowered = false
+        private set
+
+    /** Akış sürerken bağlantı koptu ya da görüntü takıldı. Bu kopmayla 720p'ye geçildiyse true. */
+    fun dropped(nowMs: Long): Boolean {
+        if (lowered) return false
+        drops.addLast(nowMs)
+        while (drops.isNotEmpty() && nowMs - drops.first() > WINDOW_MS) drops.removeFirst()
+        if (drops.size < DROPS_TO_LOWER) return false
+        lowered = true
+        return true
     }
 }
 
@@ -229,6 +337,12 @@ class StreamSession(
     @Volatile private var console = console
     private val queue = Executors.newSingleThreadScheduledExecutor { Thread(it, "CouchSubs session").apply { isDaemon = true } }
     private val policy = ReconnectPolicy()
+    /** Dinlenmedeki PS5 yalnız çeviri başlarken uyandırılır (yalnız kuyrukta). */
+    private val wakePolicy = WakePolicy()
+    /** Bağlantı sık koparsa görüntü 720p'ye düşürülür (yalnız kuyrukta). */
+    private val quality = QualityFallback()
+    /** Geçerli oturum bağlandı mı (yalnız kuyrukta): yalnız akış sürerken olan kopmalar sayılır. */
+    private var streaming = false
     /** Bağlıyken görüntü gelmezse oturum yeniden kurulur. */
     private val watchdog = PictureWatchdog()
     private val stateLock = Any()
@@ -245,6 +359,7 @@ class StreamSession(
         val current = bump(true)
         queue.execute {
             policy.reset()
+            wakePolicy.reset()
             watchdog.reset()
             connect(current)
         }
@@ -289,20 +404,35 @@ class StreamSession(
     private fun connect(current: Int) {
         if (!isCurrent(current) || native != 0L) return
         emit(SessionState.Connecting)
-        val info = ConsoleDiscovery.discover(console.host, 2000).firstOrNull() ?: relocate()
-        searchAnswered = info != null
-        Log.i(TAG, if (info == null) "PS5 ${console.host} aramaya yanıt vermedi, yine de bağlanılıyor"
-            else "PS5 ${info.name} ${info.host} ${if (info.isAwake) "uyanık" else "dinlenmede, uyandırılıyor"}")
-        if (info != null && !info.isAwake) {
-            try {
-                ConsoleDiscovery.wake(console)
-            } catch (error: Exception) {
-                Log.w(TAG, "wake: ${error.message}")
-            }
-            waitForWake(current, System.currentTimeMillis() + 20_000)
-            return
+        // Kayıtlı adreste başka bir PS5 yanıt verirse (aynı evde iki PS5, modem adresleri değiştirmiş; GitHub #425)
+        // kayıtlı PS5 adıyla ağda aranır; bulunamazsa eskisi gibi o adrese bağlanılır.
+        val atHost = ConsoleDiscovery.discover(console.host, 2000).firstOrNull()
+        val info = if (atHost != null && ConsoleDiscovery.isRegistered(atHost, console.name)) atHost else {
+            if (atHost != null) Log.i(TAG, "PS5 ${console.host} adresinde başka PS5 yanıt verdi (${atHost.name}), ${console.name} aranıyor")
+            relocate() ?: atHost
         }
-        openSession(current)
+        searchAnswered = info != null
+        val action = wakePolicy.action(info?.isAwake)
+        Log.i(TAG, if (info == null) "PS5 ${console.host} aramaya yanıt vermedi, yine de bağlanılıyor"
+            else "PS5 ${info.name} ${info.host} " + when {
+                info.isAwake -> "uyanık"
+                action == WakePolicy.Action.WAKE -> "dinlenmede, uyandırılıyor"
+                else -> "dinlenmede, açılması bekleniyor"
+            })
+        when (action) {
+            WakePolicy.Action.CONNECT -> openSession(current)
+            WakePolicy.Action.WAKE -> {
+                try {
+                    ConsoleDiscovery.wake(console)
+                } catch (error: Exception) {
+                    Log.w(TAG, "wake: ${error.message}")
+                }
+                waitForWake(current, System.currentTimeMillis() + 20_000)
+            }
+            // Kullanıcı PS5'i kapattı: yeniden açılmaz; aralıklı bakılır, PS5 açılınca bağlanılır.
+            WakePolicy.Action.WAIT_UNTIL_ON ->
+                scheduleReconnect(current, SessionState.Disconnected(DisconnectKind.CONSOLE_ASLEEP))
+        }
     }
 
     private fun relocate(): ConsoleInfo? {
@@ -353,7 +483,10 @@ class StreamSession(
         val c = console
         val swapDecoder = watchdog.swapDecoder
         if (swapDecoder) Backend.breadcrumb("PS5: önceki oturumda görüntü gelmedi; öbür çözücü türüyle deneniyor")
-        val ptr = NativeBridge.sessionStart(c.host, c.registKey, c.morning, accountId, width, height, frames,
+        // Bağlantı sık koptuysa 720p (yerel taraf yüksekliğe göre 720p ön ayarını seçer).
+        val low = quality.lowered && height > 720
+        val ptr = NativeBridge.sessionStart(c.host, c.registKey, c.morning, accountId, if (low) 1280 else width,
+            if (low) 720 else height, frames,
             swapDecoder, listener, outcome)
         if (ptr == 0L) {
             Log.w(TAG, "PS5 oturumu başlatılamadı (${c.host}): ${outcome.errors}")
@@ -366,6 +499,7 @@ class StreamSession(
 
     /** Oturumu kapatır (join içerir; yalnız kuyrukta, asla yerel geri çağrıdan değil). */
     private fun closeNative() {
+        streaming = false
         val ptr = native
         if (ptr != 0L) {
             native = 0L
@@ -381,7 +515,9 @@ class StreamSession(
         when (type) {
             NativeBridge.EVENT_CONNECTED -> queue.execute {
                 if (nativeGeneration != eventGeneration || native == 0L) return@execute
-                policy.reset()
+                policy.connected(SystemClock.elapsedRealtime())
+                wakePolicy.streamed()
+                streaming = true
                 watchdog.connected(SystemClock.elapsedRealtime())
                 emit(SessionState.Streaming)
                 scheduleWatch(eventGeneration)
@@ -426,7 +562,10 @@ class StreamSession(
                         else SessionState.Disconnected(general, text)
                     val kind = state.kind
                     Log.i(TAG, "Oturum kapandı: $kind ${state.detail.orEmpty()} $text")
+                    val wasStreaming = streaming
                     closeNative()
+                    policy.ended(SystemClock.elapsedRealtime())
+                    if (wasStreaming && QualityFallback.countsAsDrop(kind)) noteDrop()
                     if (kind == DisconnectKind.REGISTRATION_INVALID) {
                         // Kayıt geçersiz: yeniden denemek aynı yere çıkar (eskiden sonsuza kadar "Yeniden bağlanılıyor…").
                         bump(false)
@@ -460,6 +599,8 @@ class StreamSession(
                 Backend.breadcrumb(text)
                 Telemetry.event("no_picture", "next" to next.name.lowercase(), "streak" to streak, "frames" to framesReceived)
                 closeNative()
+                policy.ended(SystemClock.elapsedRealtime())
+                noteDrop()
                 if (next == PictureWatchdog.Next.GIVE_UP) {
                     // İki çözücü türüyle de görüntü gelmedi: sonsuz "yeniden bağlanılıyor" döngüsü yerine dur ve söyle.
                     bump(false)
@@ -474,13 +615,22 @@ class StreamSession(
         }
     }
 
+    /** Akış sürerken bağlantı koptu: sık oluyorsa sonraki oturumlar 720p açılır. */
+    private fun noteDrop() {
+        if (!quality.dropped(SystemClock.elapsedRealtime())) return
+        val text = "PS5 bağlantısı ${QualityFallback.WINDOW_MS / 60_000} dk içinde ${QualityFallback.DROPS_TO_LOWER} kez koptu; " +
+            "görüntü 720p'ye düşürülüyor (daha az bant genişliği)"
+        Log.w(TAG, text)
+        Backend.breadcrumb(text)
+    }
+
     private fun scheduleReconnect(current: Int, state: SessionState.Disconnected) {
         // Ağ hatasıyla düştüyse ve PS5 aramaya da yanıt vermediyse neden "bulunamadı"dır.
         val classified = if (!searchAnswered && (state.kind == DisconnectKind.NETWORK || state.kind == DisconnectKind.OTHER))
             SessionState.Disconnected(DisconnectKind.NOT_FOUND, console.host) else state
         emit(classified)
         if (!isCurrent(current)) return
-        queue.schedule({ connect(current) }, policy.nextDelaySeconds().toLong(), TimeUnit.SECONDS)
+        queue.schedule({ connect(current) }, policy.nextDelaySeconds(inUse = state.kind == DisconnectKind.IN_USE).toLong(), TimeUnit.SECONDS)
     }
 
     private fun emit(state: SessionState) {

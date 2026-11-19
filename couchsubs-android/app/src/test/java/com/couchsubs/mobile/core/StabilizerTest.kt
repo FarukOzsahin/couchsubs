@@ -320,6 +320,50 @@ class OcrNoiseTest {
         assertTrue(ButtonPrompts.isPrompt("△ Pick up"))
         assertTrue(ButtonPrompts.isPrompt("Press ✕ to jump"))
         assertFalse(ButtonPrompts.isPrompt("We go now, boy."))
+        // GTA 6: tuş simgesi okunmamış ya da harf/simge kalıntısına dönüşmüş ipuçları (havuzdaki gerçek satırlar).
+        for (line in listOf(
+            "Press to threaten the teller", "Press  to open the map", "Use to select your binoculars",
+            "Hold to open your loadout", "Press @ to open the map", "Press D to greet Joey",
+            "Hold I LI to open your loadout", "Press RE to go back to your weapons and equipment",
+            "Press (9 0 to stop focusing", "Release 2 and R2 to breathe out", "Hold + to look at Joey",
+            "Press [RB] to take cover", "Use ⓁⓇ to steer the boat", "Hold △ to enter", "Press © to call Lucia",
+            "PRESS to VAULT over obstacles", "Press to heal.", "Release Li To Use", "Use i to follow Dutch",
+            "0 0 00 0 Press • to open the index",
+        )) assertTrue(line, ButtonPrompts.isPrompt(line))
+        for (line in listOf(
+            "Press the button, Jason!", "Hold on to something.", "HOLD ON TO IT", "Use it to open the door.",
+            "Hold up, Floyd. I'm coming down there.", "Use a rope to climb down.", "Hold to your course, men.",
+            "Jason: Press to the left", "Use me to get inside.", "\"Press to the wall,\" he said", "Hold to it",
+            "Hold on, Momma Bear!", "Press on, we're almost there.",
+        )) assertFalse(line, ButtonPrompts.isPrompt(line))
+    }
+
+    /** GTA 6 (#404): etkileşim ve ekipman yazıları tek başına okununca altyazı sayılmaz; kısa konuşma kalır. */
+    @Test
+    fun actionLabelsAreNotSubtitles() {
+        val area = TextBox(0.0, 0.6, 1.0, 1.0)
+        fun alone(text: String) = Reading(listOf(TextLine(text, TextBox(0.4, 0.8, 0.6, 0.87))))
+        for (label in listOf("TAKE AMMO PACK (0/3)", "SIT", "FRESHEN UP", "• ADD TO TRUNK", "> REMOVE FROM TRUNK",
+            "D STASH", "A TURN ON", "BEAST", "BENCH PRESS")) {
+            assertTrue(label, ButtonPrompts.isActionLabel(label))
+            assertEquals(label, "", alone(label).subtitleBlock(area).text)
+            assertEquals(label, "", Reading(listOf(TextLine(label))).subtitleBlock(area).text)
+        }
+        for (speech in listOf("Yes.", "Okay.", "Why?", "OKAY.", "WHAT?", "Talk to Andy", "はい",
+            "EXCLUSIVE: LEONIDA'S TOP SPOTS FOR A DECENT CATCH")) {
+            assertFalse(speech, ButtonPrompts.isActionLabel(speech))
+            assertEquals(speech, alone(speech).subtitleBlock(area).text)
+        }
+        val withSubtitle = Reading(listOf(
+            TextLine("Hey. Looking for Andy.", TextBox(0.35, 0.7, 0.65, 0.77)),
+            TextLine("TAKE AMMO PACK (0/3)", TextBox(0.42, 0.9, 0.58, 0.97)),
+        ))
+        assertEquals("Hey. Looking for Andy.", withSubtitle.subtitleBlock(area).text)
+        val wrapped = Reading(listOf(
+            TextLine("I TOLD YOU", TextBox(0.42, 0.7, 0.58, 0.77)),
+            TextLine("NOT TO GO THERE.", TextBox(0.4, 0.78, 0.6, 0.85)),
+        ))
+        assertEquals("I TOLD YOU\nNOT TO GO THERE.", wrapped.subtitleBlock(area).text)
     }
 }
 

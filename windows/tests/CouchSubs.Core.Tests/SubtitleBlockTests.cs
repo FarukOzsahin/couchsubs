@@ -64,10 +64,99 @@ public class SubtitleBlockTests
     [InlineData("Hand me the L1.", false)]
     public void ButtonAtTheEndIsAPrompt(string line, bool prompt) => Assert.Equal(prompt, ButtonPrompts.IsPrompt(line));
 
+    /// <summary>GTA 6: tuş simgesi okunmamış ya da harf/simge kalıntısına dönüşmüş ipuçları (havuzdaki gerçek satırlar).</summary>
+    [Theory]
+    [InlineData("Press to threaten the teller", true)]
+    [InlineData("Press  to open the map", true)]
+    [InlineData("Use to select your binoculars", true)]
+    [InlineData("Hold to open your loadout", true)]
+    [InlineData("Press @ to open the map", true)]
+    [InlineData("Press D to greet Joey", true)]
+    [InlineData("Hold I LI to open your loadout", true)]
+    [InlineData("Press RE to go back to your weapons and equipment", true)]
+    [InlineData("Press (9 0 to stop focusing", true)]
+    [InlineData("Release 2 and R2 to breathe out", true)]
+    [InlineData("Hold + to look at Joey", true)]
+    [InlineData("Press [RB] to take cover", true)]
+    [InlineData("Use ⓁⓇ to steer the boat", true)]
+    [InlineData("Hold △ to enter", true)]
+    [InlineData("Press © to call Lucia", true)]
+    [InlineData("PRESS to VAULT over obstacles", true)]
+    [InlineData("Press to heal.", true)]
+    [InlineData("Release Li To Use", true)]
+    [InlineData("Use i to follow Dutch", true)]
+    [InlineData("0 0 00 0 Press • to open the index", true)]
+    [InlineData("Press the button, Jason!", false)]
+    [InlineData("Hold on to something.", false)]
+    [InlineData("HOLD ON TO IT", false)]
+    [InlineData("Use it to open the door.", false)]
+    [InlineData("Hold up, Floyd. I'm coming down there.", false)]
+    [InlineData("Use a rope to climb down.", false)]
+    [InlineData("Hold to your course, men.", false)]
+    [InlineData("Jason: Press to the left", false)]
+    [InlineData("Use me to get inside.", false)]
+    [InlineData("\"Press to the wall,\" he said", false)]
+    [InlineData("Hold to it", false)]
+    [InlineData("Hold on, Momma Bear!", false)]
+    [InlineData("Press on, we're almost there.", false)]
+    public void PromptWithUnreadIconIsAPrompt(string line, bool prompt) => Assert.Equal(prompt, ButtonPrompts.IsPrompt(line));
+
     [Theory]
     [InlineData("9? We'll lose these tracks.", "We'll lose these tracks.")]
     [InlineData("100. Mac and John...", "Mac and John...")]
     [InlineData("23m CESARE: It's here! Shoot him!", "CESARE: It's here! Shoot him!")]
     [InlineData("100 men came", "100 men came")]
     public void GaugeNumberStuckToLineIsDropped(string line, string clean) => Assert.Equal(clean, OcrNoise.Clean(line));
+
+    /// <summary>GTA 6 (#404): etkileşim ve ekipman yazıları tek başına okununca altyazı sayılmaz.</summary>
+    [Theory]
+    [InlineData("TAKE AMMO PACK (0/3)")]
+    [InlineData("SIT")]
+    [InlineData("CLOSE")]
+    [InlineData("FRESHEN UP")]
+    [InlineData("• ADD TO TRUNK")]
+    [InlineData("> REMOVE FROM TRUNK")]
+    [InlineData("D STASH")]
+    [InlineData("A TURN ON")]
+    [InlineData("BEAST")]
+    [InlineData("BENCH PRESS")]
+    public void ActionLabelIsNotASubtitle(string label)
+    {
+        Assert.True(ButtonPrompts.IsActionLabel(label));
+        Assert.Empty(new Reading([Line(label, 0.4, 0.8, 0.6)]).SubtitleBlock(Area).Lines);
+        Assert.Empty(Reading.FromText(label).SubtitleBlock(Area).Lines);
+    }
+
+    /// <summary>Kısa gerçek konuşma ve görev yazısı kalır.</summary>
+    [Theory]
+    [InlineData("Yes.")]
+    [InlineData("Okay.")]
+    [InlineData("Why?")]
+    [InlineData("OKAY.")]
+    [InlineData("WHAT?")]
+    [InlineData("Talk to Andy")]
+    [InlineData("EXCLUSIVE: LEONIDA'S TOP SPOTS FOR A DECENT CATCH")]
+    [InlineData("はい")]
+    public void ShortSpeechIsKept(string speech)
+    {
+        Assert.False(ButtonPrompts.IsActionLabel(speech));
+        Assert.Equal(speech, new Reading([Line(speech, 0.4, 0.8, 0.6)]).SubtitleBlock(Area).Text);
+    }
+
+    [Fact]
+    public void ActionLabelBelowSubtitleDoesNotHideIt()
+    {
+        var reading = new Reading([
+            Line("Hey. Looking for Andy.", 0.35, 0.7, 0.65),
+            Line("TAKE AMMO PACK (0/3)", 0.42, 0.9, 0.58),
+        ]);
+        Assert.Equal("Hey. Looking for Andy.", reading.SubtitleBlock(Area).Text);
+    }
+
+    [Fact]
+    public void WrappedAllCapsSubtitleStaysTogether()
+    {
+        var reading = new Reading([Line("I TOLD YOU", 0.42, 0.7, 0.58), Line("NOT TO GO THERE.", 0.4, 0.78, 0.6)]);
+        Assert.Equal("I TOLD YOU\nNOT TO GO THERE.", reading.SubtitleBlock(Area).Text);
+    }
 }

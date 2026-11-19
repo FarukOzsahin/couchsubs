@@ -20,7 +20,8 @@
     <string name="phase_reconnecting">Bağlantı koptu, yeniden bağlanılıyor…</string>
     <string name="phase_in_use">PS5 başka bir Remote Play bağlantısında. Diğer cihazı kapat.</string>
     <string name="phase_not_found_host">PS5 %1$s adresinde bulunamadı. Açık ve aynı ağda olduğundan emin ol. Yeniden bağlanılıyor…</string>
-    <string name="phase_network">PS5\'e ulaşılamıyor. Yeniden bağlanılıyor…</string>
+    <string name="phase_network">PS5 ile bağlantı koptu, yeniden bağlanılıyor… Sık oluyorsa PS5\'i modeme kabloyla bağla.</string>
+    <string name="phase_remote_play_disabled">PS5\'te Uzaktan Oynama kapalı (kod %1$s). PS5\'te Ayarlar › Sistem › Uzaktan Oynama\'ya gidip Uzaktan Oynama\'yı Etkinleştir\'i aç.</string>
     <string name="phase_rejected_code">PS5 bağlantıyı reddetti (kod %1$s). Başka bir Uzaktan Oynatma (PS Remote Play) açık olabilir ya da PS5 başka bir oturumda olabilir. PS Remote Play\'i kapat, PS5\'i yeniden başlatıp tekrar dene.</string>
     <string name="phase_rejected">PS5 oturumu başlatmadı. Başka bir Uzaktan Oynatma (PS Remote Play) açık olabilir ya da PS5 başka bir oturumda olabilir. PS Remote Play\'i kapat, PS5\'i yeniden başlatıp tekrar dene.</string>
     <string name="phase_registration_invalid">PS5 bu eşlemeyi kabul etmedi. Ayarlar\'dan PS5\'i ikinci hesapla yeniden eşle.</string>
@@ -35,7 +36,11 @@
     <string name="error_native">Bu cihazda Remote Play kütüphanesi yüklenemedi.</string>
     <string name="error_port">Altyazı sunucusu açılamadı (8787 kullanımda).</string>
     <string name="error_translation">Çeviri şu an yapılamıyor; yeniden deneniyor.</string>
-    <string name="error_model">Ücretsiz çeviri modeli indirilemedi. İnternet bağlantını kontrol et.</string>
+    <string name="error_model">Ücretsiz çeviri modeli indirilemedi. Yeniden dene; sorun sürerse hata kaydını paylaş.</string>
+    <string name="error_model_network">Çeviri modeli ağ hatası nedeniyle indirilemedi. Bağlantını ve DNS/VPN ayarlarını kontrol edip yeniden dene.</string>
+    <string name="error_model_storage">Çeviri modeli için telefonda yeterli boş alan yok. Yer açıp yeniden dene.</string>
+    <string name="error_model_unavailable">Çeviri modeli hizmeti şu anda kullanılamıyor. Google Play Hizmetleri güncellemelerini kontrol edip yeniden dene.</string>
+    <string name="error_model_timeout">Çeviri modeli indirmesi zaman aşımına uğradı. Bağlantını kontrol edip yeniden dene.</string>
     <string name="screen_translate">Ekranı çevir</string>
     <string name="screen_working">Ekran çevriliyor…</string>
     <string name="screen_remove">Çevirileri kaldır</string>
@@ -78,6 +83,7 @@
     <string name="psn_problem_crashed">Uygulama içi tarayıcı (Android System WebView) çalışmadı. Play Store\'dan güncellemeyi deneyebilirsin.</string>
     <string name="psn_problem_other">Sayfa yüklenirken bir hata oldu.</string>
     <string name="pair_title">PS5\'i eşle</string>
+    <string name="pair_hide_status">Ekrandaki \"Uzaktan Oynama bağlandı\" yazısını gizlemek için: PS5\'te Ayarlar › Sistem › Uzaktan Oynama\'ya gidip Uzaktan Oynama Bağlantı Durumu Açılır Penceresini Gizle\'yi aç. Bunu hem ana hesabında hem ikinci hesapta yap.</string>
     <string name="pair_body">PS5\'te ikinci hesapla Ayarlar › Sistem › Uzaktan Oynatma › Cihazı Eşle\'yi seç, ekrandaki kodu yaz.</string>
     <string name="pair_searching">PS5 aranıyor…</string>
     <string name="pair_address">PS5 adresi (ör. 192.168.1.20)</string>
@@ -91,7 +97,7 @@
     <string name="target_phone">Bu telefonda</string>
     <string name="target_tvs_none">Ağda TV görülmedi (TV kapalı olabilir; sorun değil).</string>
 
-    <string name="main_phone_view">Altyazıyı telefonda göster</string>
+    <string name="main_phone_view">Altyazı ekranı</string>
     <string name="main_target">Altyazı</string>
     <string name="main_target_tv">TV</string>
     <string name="main_target_phone">Bu telefon</string>
@@ -152,6 +158,9 @@
     <string name="settings_display_mode_note">PS5 görüntüsü CouchSubs TV uygulamasının içinde siyah kalıyorsa Katman\'ı seçin: TV, PS5\'i kendi HDMI girişinde gösterir, altyazı görüntünün üstünde çıkar. Görüntü gelmezse TV uygulaması önce HDMI girişlerini gösterir, Katman varsa ona geçer. Google Play\'den kurulan TV uygulamasında Katman yok: orada bu seçim uygulanmaz, TV bunu ekranda söyler.</string>
     <string name="settings_screen_on">Ekranı açık tut</string>
     <string name="close">Kapat</string>
+    <!-- Kendi ürünlerimizin tanıtım popup'ı (promo.json) -->
+    <string name="promo_label">Sponsorlu</string>
+    <string name="promo_open">Bağlantıyı aç</string>
     <string name="ok">Tamam</string>
     <string name="next_continue">Devam</string>
     <string name="setup_step">Kurulum · Adım %1$d/3</string>
@@ -251,7 +260,7 @@
     <string name="settings_fast_reading">Değişmeyen altyazı alanını daha sık oku</string>
     <string name="settings_fast_reading_short">Altyazı alanı değişmemiş görünüyorsa 20 yerine 2 kare sonra yeniden oku. Daha fazla CPU kullanır.</string>
     <string name="settings_xbox_audio">Xbox sesini bu cihazda çal</string>
-    <string name="settings_xbox_audio_short">Xbox uzaktan oynatmada sesi bu cihaza yönlendirir; kapatırsanız oyun sessiz kalabilir.</string>
+    <string name="settings_xbox_audio_short">Xbox, uzaktan oynatma sürerken TV\'nin sesini kapatır ve oyun sesini yalnız bu cihaza gönderir (Xbox kısıtı). Kapatırsanız oyunun sesi hiç gelmez. TV\'den ya da hoparlörden duymak için telefonu Bluetooth ile hoparlöre ya da kulaklığa bağlayın.</string>
     <string name="running_now">Şimdi</string>
     <string name="running_ready_translation">hazır çeviri</string>
     <string name="running_ready">hazır</string>
@@ -423,6 +432,8 @@
     <string name="tvinstall_android_wireless_step3">3. İlk kurulumda “Cihazı eşleme kodu ile eşle”ye bas; açılan penceredeki IP adresi ve portu, 6 haneli kodla birlikte buraya yaz ve pencere açıkken Kur ve aç\'a bas.</string>
     <string name="tvinstall_android_replace">TV\'deki kopyayı kaldırıp kur</string>
     <string name="tvinstall_android_err_unreachable">TV yanıt vermedi. TV\'nin açık ve bu telefonla aynı Wi-Fi\'da olduğundan, geliştirici seçeneklerinde hata ayıklamanın açık olduğundan emin ol. Kablosuz hata ayıklamada port her açılışta değişir; ekrandakini yaz.</string>
+    <string name="tvinstall_android_try_wireless">Kablosuz hata ayıklamayla dene</string>
+    <string name="tvinstall_android_err_legacy_closed">TV, USB/ağ hata ayıklama portuna (5555) yanıt vermedi. Yeni Android TV ve Google TV\'lerde bu port kapalıdır. TV\'de Geliştirici seçenekleri › Kablosuz hata ayıklama\'yı aç, sonra aşağıdaki düğmeye dokun.</string>
     <string name="tvinstall_android_err_not_approved">TV\'de hata ayıklamaya izin verilmedi. Tekrar dene ve TV\'de İzin ver\'i seç.</string>
     <string name="tvinstall_android_err_not_paired">TV bu telefonu tanımıyor. Kablosuz hata ayıklamada önce eşle: TV\'de “Cihazı eşleme kodu ile eşle”ye bas, penceredeki adresi ve kodu yazıp tekrar dene.</string>
     <string name="tvinstall_android_err_pairing">Eşleme olmadı: kod yanlış ya da TV\'deki eşleme penceresi kapandı. Pencereyi yeniden aç, yeni kodu ve portu yazıp tekrar dene.</string>
@@ -432,9 +443,10 @@
     <string name="history">Geçmiş</string>
     <string name="history_note">Çevrilen son %1$d satır bu telefonda saklanır.</string>
     <string name="history_empty">Henüz altyazı yok. Bu ve önceki oturumlarda çevrilen satırlar burada görünür.</string>
-    <string name="history_copy_all">Tümünü kopyala</string>
     <string name="history_copied">Kopyalandı</string>
     <string name="history_copy">Kopyala</string>
+    <string name="developer_label">Geliştirici</string>
+    <string name="developer_a11y">Geliştirici: Enmera</string>
     <string name="history_clear">Temizle</string>
     <string name="history_clear_title">Geçmiş temizlensin mi?</string>
     <string name="history_clear_body">Kaydedilen bütün satırlar bu telefondan silinir.</string>
@@ -453,6 +465,7 @@
     <string name="area_drag_note_free">Çerçeveyi sürükleyerek taşı, kenarından ya da köşesinden sürükleyerek boyutlandır.</string>
     <string name="area_preview_empty">Çeviri başlayınca oyun görüntüsü burada görünür.</string>
     <string name="extra_title">Ek alanlar</string>
+    <string name="extra_full_screen_note">Altyazı alanı Tam ekranken ek alanlar okunmaz, çünkü ekranın tamamı zaten okunuyor. Başka bir alan seçince yeniden okunur.</string>
     <string name="extra_note">CouchSubs altyazının yanında görev yazısı, telefon mesajı ya da bildirim gibi en çok üç küçük alanı da sürekli okuyabilir. Her alan yaklaşık saniyede bir okunur, yazısı değişmedikçe yeniden çevrilmez. Çeviri TV\'de ve bu telefonun altyazı ekranında asıl yazının yerinde görünür.</string>
     <string name="extra_add">Ek alan ekle</string>
     <string name="extra_name">Alanın adı</string>

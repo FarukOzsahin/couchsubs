@@ -349,8 +349,13 @@ private struct ExtraAreasCard: View {
     var body: some View {
         Card(title: "Extra areas") {
             HintText(text: "Besides the subtitle, CouchSubs can keep reading up to three small areas, like a quest, a phone message or a notification. Each area is read about once a second and translated again only when its text changes. The translation shows on the TV next to the original text.")
+            // Tam ekranda ek alanlar okunmaz (bkz. activeExtraAreas); ayarları korunur, düzenlenebilir.
+            if model.settings.extraAreasPausedByFullScreen, !model.settings.extraAreas.isEmpty {
+                HintText(text: "Extra areas aren't read while the subtitle area is Full screen, because the whole screen is already read. They're read again when you pick another area.")
+            }
             ForEach(model.settings.extraAreas) { area in
                 ExtraAreaEditor(id: area.id, settings: $model.settings, preview: model.framePreview)
+                    .opacity(model.settings.extraAreasPausedByFullScreen ? 0.5 : 1)
             }
             if model.settings.canAddExtraArea {
                 Menu("Add extra area") {
@@ -935,13 +940,19 @@ struct TranslationCard: View {
             // Ek talimat (#306) yalnız yapay zekâ motorlarında (Gemini, OpenAI, Claude, yerel model); DeepL'de yoktur.
             if engine.aiProvider != nil { AIInstructionSection() }
             if engine == .gemini {
+                Toggle("I use a paid Gemini API key", isOn: $model.settings.geminiPaidTier)
+                HintText(text: "Paid API keys may incur charges. Google still enforces quotas.")
                 HintText(text: FreeGemini.privacy)
-                HintText(text: FreeGemini.limit)
+                if !model.settings.geminiPaidTier {
+                    HintText(text: FreeGemini.limit)
+                }
             }
         }
         Card(title: "Advanced") {
             SwitchRow(title: "Check unchanged subtitle areas more often", isOn: $model.settings.fastSubtitleDetection)
             HintText(text: "When the subtitle area looks unchanged, read it again after 2 frames instead of 20. Uses more CPU.")
+            SwitchRow(title: "Watch subtitle background (GTA 6 experimental)", isOn: $model.settings.watchSubtitleBackground)
+            HintText(text: "Only translate lines on GTA 6’s dark blue subtitle background. Other text in the subtitle area is ignored.")
         }
     }
 
